@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QListWidget, QListWidgetItem, QHeaderView, QGroupBox,
     QStatusBar, QAbstractItemView, QFrame, QGridLayout,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QPen, QPolygonF
 from PyQt6.QtCore import QPointF
 import math
@@ -339,16 +339,31 @@ class Database:
         ).fetchall()]
 
     def latest_by_category(self) -> List[Dict]:
-        """Return the highest part number per category (excluding 003)."""
-        rows = self.con.execute("""
-            SELECT category_code, category_name,
-                   MAX(part_number) as latest_part
+        """Return the highest part number per category whose file still exists on disk.
+        Uses a fresh connection for an up-to-date read, then walks from highest to
+        lowest within each category until it finds a file that actually exists."""
+        con = sqlite3.connect(str(DB_PATH), timeout=10)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT category_code, category_name, part_number, full_path
             FROM parts
             WHERE category_code != '003'
-            GROUP BY category_code
-            ORDER BY category_code
+            ORDER BY category_code, part_number DESC
         """).fetchall()
-        return [dict(r) for r in rows]
+        con.close()
+
+        result: Dict[str, dict] = {}
+        for row in rows:
+            code = row["category_code"]
+            if code in result:
+                continue   # already found the latest existing file for this category
+            if Path(row["full_path"]).exists():
+                result[code] = {
+                    "category_code": code,
+                    "category_name": row["category_name"],
+                    "latest_part":   row["part_number"],
+                }
+        return list(result.values())
 
     def clear_all(self):
         self.con.executescript("DELETE FROM parts; DELETE FROM jobs;")
@@ -481,9 +496,10 @@ def parse_result(name: str, path: str) -> Optional[Dict]:
 
 # ── Scanner Thread ─────────────────────────────────────────────────────────
 class ScanWorker(QThread):
-    progress = pyqtSignal(int, str)   # percent, message
-    done     = pyqtSignal(int, int)   # new_parts, new_jobs
-    err      = pyqtSignal(str)
+    progress      = pyqtSignal(int, str)   # percent, message
+    done          = pyqtSignal(int, int)   # new_parts, new_jobs
+    err           = pyqtSignal(str)
+    folders_found = pyqtSignal(list)       # list of folder path strings to watch
 
     def __init__(self, db: Database, user_prefix: str):
         super().__init__()
@@ -572,10 +588,71 @@ class ScanWorker(QThread):
                     new_parts += 1
 
             self.progress.emit(100, "Complete")
+            self.folders_found.emit([str(f) for f in folders])
             self.done.emit(new_parts, new_jobs)
 
         except Exception as e:
             self.err.emit(str(e))
+
+
+# ── Directory Re-scan Worker ───────────────────────────────────────────────
+class DirectoryRescanWorker(QThread):
+    """Lightweight re-scan of a single directory triggered by QFileSystemWatcher."""
+    done = pyqtSignal()
+
+    def __init__(self, db: Database, directory: str):
+        super().__init__()
+        self.db        = db
+        self.directory = Path(directory)
+
+    def run(self):
+        try:
+            dir_str = str(self.directory)
+
+            # Find the job_id this directory belongs to via existing DB records
+            row = self.db.con.execute(
+                "SELECT job_id FROM parts WHERE full_path LIKE ? LIMIT 1",
+                (dir_str + "%",)
+            ).fetchone()
+            if not row:
+                return
+            job_id = row["job_id"]
+
+            # Enumerate current files on disk
+            try:
+                disk_files = {
+                    str(f): f
+                    for f in self.directory.iterdir()
+                    if f.suffix.lower() in (".sldprt", ".sldasm") and PART_RE.match(f.name)
+                }
+            except Exception:
+                return
+
+            # Upsert every file currently on disk
+            for path_str, f in disk_files.items():
+                m = PART_RE.match(f.name)
+                cat_code = m.group(1)
+                five_dig = m.group(2)
+                file_ext = m.group(3).lower()
+                self.db.upsert_part(
+                    f"{cat_code}-{five_dig}", cat_code,
+                    CATEGORIES.get(cat_code, "Unknown"),
+                    five_dig, file_ext, path_str, job_id
+                )
+
+            # Delete DB records for files that no longer exist on disk
+            db_rows = self.db.con.execute(
+                "SELECT id, full_path FROM parts WHERE full_path LIKE ?",
+                (dir_str + "%",)
+            ).fetchall()
+            missing = [r["id"] for r in db_rows if r["full_path"] not in disk_files]
+            if missing:
+                self.db.con.executemany("DELETE FROM parts WHERE id=?", [(i,) for i in missing])
+                self.db.con.commit()
+
+            self.done.emit()
+        except Exception:
+            pass
 
 
 # ── Scan Progress Dialog ───────────────────────────────────────────────────
@@ -1134,6 +1211,16 @@ class NextNumbersTab(QWidget):
         self._cards: Dict[str, dict] = {}   # cat_code -> {latest_lbl, next_lbl}
         self._build()
 
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._safe_refresh)
+        self._poll_timer.start(5_000)    # refresh every 5 seconds
+
+    def _safe_refresh(self):
+        try:
+            self.refresh()
+        except Exception:
+            pass  # skip this tick on transient DB errors (e.g. lock during scan)
+
     def _build(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(16, 14, 16, 14)
@@ -1268,8 +1355,11 @@ class MainWindow(QMainWindow):
         self.db          = db
         self.user_name   = user_name
         self.user_prefix = user_prefix
-        self._scan_dlg   = None
-        self._worker     = None
+        self._scan_dlg      = None
+        self._worker        = None
+        self._rescan_worker = None
+        self._watcher       = QFileSystemWatcher(self)
+        self._watcher.directoryChanged.connect(self._on_dir_changed)
         self._build()
         # Delay scan so window renders first
         QTimer.singleShot(200, self._start_scan)
@@ -1378,6 +1468,7 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._scan_dlg.update)
         self._worker.done.connect(self._scan_done)
         self._worker.err.connect(self._scan_err)
+        self._worker.folders_found.connect(self._update_watcher)
         self._worker.start()
         self._scan_dlg.exec()
 
@@ -1390,6 +1481,26 @@ class MainWindow(QMainWindow):
             f"Scan complete — {new_parts:,} part(s) processed, {new_jobs} new job(s)",
             8000
         )
+
+    def _update_watcher(self, folder_paths: list):
+        """Replace watched directories with the latest set of scanned folders."""
+        old = self._watcher.directories()
+        if old:
+            self._watcher.removePaths(old)
+        if folder_paths:
+            self._watcher.addPaths(folder_paths)
+
+    def _on_dir_changed(self, path: str):
+        """A watched directory changed — re-scan it in the background."""
+        if self._rescan_worker and self._rescan_worker.isRunning():
+            return
+        self._rescan_worker = DirectoryRescanWorker(self.db, path)
+        self._rescan_worker.done.connect(self._rescan_done)
+        self._rescan_worker.start()
+
+    def _rescan_done(self):
+        self._reload_tabs()
+        self.status_bar.showMessage("File change detected — numbers updated.", 4000)
 
     def _scan_err(self, msg):
         if self._scan_dlg:
