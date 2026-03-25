@@ -220,6 +220,7 @@ class Database:
                 enclosure_size  TEXT,
                 prf_path        TEXT,
                 scanned_at      TEXT,
+                is_archived     INTEGER DEFAULT 0,
                 UNIQUE(job_number, sub_job)
             );
 
@@ -239,6 +240,12 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_p_cat  ON parts(category_code);
         """)
         self.con.commit()
+        # Migration: add is_archived to existing databases
+        try:
+            self.con.execute("ALTER TABLE jobs ADD COLUMN is_archived INTEGER DEFAULT 0")
+            self.con.commit()
+        except Exception:
+            pass  # column already exists
 
     # settings
     def get(self, key, default=None):
@@ -257,18 +264,19 @@ class Database:
         return r["id"] if r else None
 
     def upsert_job(self, job_number, job_name, sub_job,
-                   catalog_no=None, enclosure_size=None, prf_path=None):
+                   catalog_no=None, enclosure_size=None, prf_path=None, is_archived=0):
         self.con.execute("""
-            INSERT INTO jobs(job_number,job_name,sub_job,catalog_no,enclosure_size,prf_path,scanned_at)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO jobs(job_number,job_name,sub_job,catalog_no,enclosure_size,prf_path,scanned_at,is_archived)
+            VALUES(?,?,?,?,?,?,?,?)
             ON CONFLICT(job_number,sub_job) DO UPDATE SET
                 job_name       = excluded.job_name,
                 catalog_no     = COALESCE(excluded.catalog_no,    catalog_no),
                 enclosure_size = COALESCE(excluded.enclosure_size, enclosure_size),
                 prf_path       = COALESCE(excluded.prf_path,      prf_path),
-                scanned_at     = excluded.scanned_at
+                scanned_at     = excluded.scanned_at,
+                is_archived    = excluded.is_archived
         """, (job_number, job_name, sub_job, catalog_no, enclosure_size, prf_path,
-              datetime.now().isoformat()))
+              datetime.now().isoformat(), is_archived))
         self.con.commit()
         return self.job_id(job_number, sub_job)
 
@@ -300,7 +308,8 @@ class Database:
         return self.con.execute(q, args).fetchall()
 
     def get_parts(self, search="", user_prefix="", category="", job_id=None, file_ext=""):
-        q = """SELECT p.*, j.job_number, j.job_name, j.sub_job, j.catalog_no, j.enclosure_size
+        q = """SELECT p.*, j.job_number, j.job_name, j.sub_job,
+                      j.catalog_no, j.enclosure_size, j.is_archived
                FROM parts p LEFT JOIN jobs j ON p.job_id=j.id WHERE 1=1"""
         args = []
         if search:
@@ -338,32 +347,137 @@ class Database:
             "SELECT DISTINCT catalog_no FROM jobs WHERE catalog_no IS NOT NULL ORDER BY 1"
         ).fetchall()]
 
-    def latest_by_category(self) -> List[Dict]:
+    def get_cat_prefixes(self) -> Dict[str, str]:
+        """Return per-category prefix overrides, e.g. {'240': '804'}."""
+        result = {}
+        for code in CATEGORIES:
+            if code == "003":
+                continue
+            val = self.get(f"cat_prefix_{code}")
+            if val:
+                result[code] = val
+        return result
+
+    def set_cat_prefixes(self, cat_prefixes: Dict[str, str]):
+        """Persist per-category prefix overrides.  Pass empty string to clear a key."""
+        for code in CATEGORIES:
+            if code == "003":
+                continue
+            val = cat_prefixes.get(code, "")
+            if val:
+                self.put(f"cat_prefix_{code}", val)
+            else:
+                self.con.execute("DELETE FROM settings WHERE key=?", (f"cat_prefix_{code}",))
+        self.con.commit()
+
+    @staticmethod
+    def _prefix_range(user_prefix: str):
+        """Return (lo, hi) integer range covering this user's 5-digit part IDs.
+        e.g. prefix '9'  → (90000, 99999)
+             prefix '51' → (51000, 51999)"""
+        p = int(user_prefix)
+        pad = 5 - len(user_prefix)
+        lo = p * (10 ** pad)
+        hi = (p + 1) * (10 ** pad) - 1
+        return lo, hi
+
+    def latest_by_category(self, user_prefix: str = "",
+                            cat_prefixes: Dict[str, str] = None) -> List[Dict]:
         """Return the highest part number per category whose file still exists on disk.
-        Uses a fresh connection for an up-to-date read, then walks from highest to
-        lowest within each category until it finds a file that actually exists."""
+        Each category uses its own prefix override when provided, otherwise falls back
+        to user_prefix.  Uses a fresh connection for an up-to-date read."""
+        if cat_prefixes is None:
+            cat_prefixes = {}
         con = sqlite3.connect(str(DB_PATH), timeout=10)
         con.row_factory = sqlite3.Row
-        rows = con.execute("""
-            SELECT category_code, category_name, part_number, full_path
-            FROM parts
-            WHERE category_code != '003'
-            ORDER BY category_code, part_number DESC
-        """).fetchall()
-        con.close()
 
         result: Dict[str, dict] = {}
-        for row in rows:
-            code = row["category_code"]
-            if code in result:
-                continue   # already found the latest existing file for this category
-            if Path(row["full_path"]).exists():
-                result[code] = {
-                    "category_code": code,
-                    "category_name": row["category_name"],
-                    "latest_part":   row["part_number"],
-                }
+        for cat_code, cat_name in CATEGORIES.items():
+            if cat_code == "003":
+                continue
+            pfx = cat_prefixes.get(cat_code, user_prefix)
+            if pfx:
+                lo, hi = self._prefix_range(pfx)
+                rows = con.execute("""
+                    SELECT part_number, full_path
+                    FROM parts
+                    WHERE category_code = ?
+                      AND CAST(user_prefix AS INTEGER) BETWEEN ? AND ?
+                    ORDER BY part_number DESC
+                """, (cat_code, lo, hi)).fetchall()
+            else:
+                rows = con.execute("""
+                    SELECT part_number, full_path
+                    FROM parts
+                    WHERE category_code = ?
+                    ORDER BY part_number DESC
+                """, (cat_code,)).fetchall()
+
+            for row in rows:
+                if Path(row["full_path"]).exists():
+                    result[cat_code] = {
+                        "category_code": cat_code,
+                        "category_name": cat_name,
+                        "latest_part":   row["part_number"],
+                        "effective_pfx": pfx,
+                    }
+                    break   # found the latest existing file for this category
+
+        con.close()
         return list(result.values())
+
+    def gaps_by_category(self, user_prefix: str,
+                         cat_prefixes: Dict[str, str] = None) -> Dict[str, List[str]]:
+        """Find skipped/missing part numbers per category for this user.
+        Each category uses its own prefix override when set.
+        Returns {cat_code: [missing_part_number, ...]} for categories with gaps."""
+        if not user_prefix:
+            return {}
+        if cat_prefixes is None:
+            cat_prefixes = {}
+
+        con = sqlite3.connect(str(DB_PATH), timeout=10)
+        con.row_factory = sqlite3.Row
+
+        result: Dict[str, List[str]] = {}
+        for cat_code in CATEGORIES:
+            if cat_code == "003":
+                continue
+            pfx = cat_prefixes.get(cat_code, user_prefix)
+            lo, hi = self._prefix_range(pfx)
+
+            rows = con.execute("""
+                SELECT part_number FROM parts
+                WHERE category_code = ?
+                  AND CAST(user_prefix AS INTEGER) BETWEEN ? AND ?
+                ORDER BY part_number
+            """, (cat_code, lo, hi)).fetchall()
+
+            if len(rows) < 2:
+                continue
+
+            nums = []
+            for row in rows:
+                try:
+                    nums.append(int(row["part_number"].split("-")[1]))
+                except Exception:
+                    continue
+
+            if len(nums) < 2:
+                continue
+
+            nums.sort()
+            present = set(nums)
+            gaps = [
+                f"{cat_code}-{str(n).zfill(5)}"
+                for n in range(nums[0] + 1, nums[-1])
+                if n not in present
+            ]
+            if gaps:
+                result[cat_code] = gaps
+
+        con.close()
+        return result
 
     def clear_all(self):
         self.con.executescript("DELETE FROM parts; DELETE FROM jobs;")
@@ -417,6 +531,68 @@ def find_003_folders(user_prefix: str) -> List[Path]:
             "Enable it in Everything:\n"
             "Tools → Options → HTTP Server → Enable (port 8080)"
         )
+
+
+# ── Gap Finder (Everything-based) ──────────────────────────────────────────
+def find_gaps_via_everything(
+    user_prefix: str,
+    cat_prefixes: Dict[str, str] = None,
+) -> Dict[str, List[str]]:
+    """Compute genuine gaps by asking Everything for every file on disk.
+    For each category, fetches ALL files matching the user's prefix under
+    JOBS_ROOT, then finds numbers missing between the lowest and highest found.
+    Because it queries Everything directly, parts that exist in ANY folder
+    (scanned or not) are never reported as gaps.
+    Returns {} on error (Everything unreachable, etc.).
+    """
+    if not user_prefix:
+        return {}
+    if cat_prefixes is None:
+        cat_prefixes = {}
+    try:
+        import requests
+        session = requests.Session()
+        result: Dict[str, List[str]] = {}
+
+        for cat_code in CATEGORIES:
+            if cat_code == "003":
+                continue
+            pfx = cat_prefixes.get(cat_code, user_prefix)
+            lo, hi = Database._prefix_range(pfx)
+
+            # Fetch every matching file from Everything for this category+prefix
+            hits: List[Dict] = []
+            for ext in ("sldprt", "sldasm"):
+                hits += _eq(
+                    session,
+                    f'"{cat_code}-{pfx}" ext:{ext} path:"{JOBS_ROOT}"',
+                )
+
+            # Collect numeric part of each matching filename, filtered to user range
+            present: set = set()
+            for hit in hits:
+                m = PART_RE.match(hit["name"])
+                if m and m.group(1) == cat_code:
+                    n = int(m.group(2))
+                    if lo <= n <= hi:
+                        present.add(n)
+
+            if len(present) < 2:
+                continue
+
+            min_n, max_n = min(present), max(present)
+            gaps = [
+                f"{cat_code}-{str(n).zfill(5)}"
+                for n in range(min_n + 1, max_n)
+                if n not in present
+            ]
+            if gaps:
+                result[cat_code] = gaps
+
+        return result
+
+    except Exception:
+        return {}   # Everything unreachable or error — show no gaps
 
 
 # ── PRF Reader ─────────────────────────────────────────────────────────────
@@ -520,9 +696,11 @@ class ScanWorker(QThread):
             for i, folder in enumerate(folders):
                 pct = 5 + int(90 * i / total)
 
-                # Step 2: parse job info from the folder path
-                # folder is something like:
-                # Z:\FOXFAB_DATA\ENGINEERING\2 JOBS\J15302 Garner Road\200 Mech\J15302-01\201 CAD
+                # Step 2: parse job info from the folder path.
+                # Typical structure:
+                #   Z:\FOXFAB_DATA\...\J15302 Garner Road\200 Mech\J15302-01\201 CAD
+                # If the 003- file was moved to an archive sub-folder, Everything will
+                # have returned that archive folder as the path — detect and flag it.
                 parts_list = list(folder.parts)
                 job_number = job_name_str = sub_job = None
                 job_root_path = None
@@ -543,12 +721,24 @@ class ScanWorker(QThread):
                 if not sub_job:
                     sub_job = job_number
 
+                # Step 2a: verify this sub-job's folder actually contains the user's
+                # 003- assembly at the top level (confirms it's the right sub-job).
+                # find_003_folders already guarantees this for the returned folder, but
+                # if the file is inside an "archive" sub-folder, flag the job.
+                is_archived = any(p.lower() == "archive" for p in parts_list)
+
                 key = (job_number, sub_job)
 
                 # Step 3: upsert job — read PRF only if new
                 existing_id = self.db.job_id(*key)
                 if existing_id:
                     job_id = existing_id
+                    # Always update the archived flag in case it changed
+                    self.db.con.execute(
+                        "UPDATE jobs SET is_archived=? WHERE id=?",
+                        (1 if is_archived else 0, existing_id)
+                    )
+                    self.db.con.commit()
                 else:
                     self.progress.emit(pct, f"New job {job_number} — reading PRF…")
                     prf_data = {"catalog_no": None, "enclosure_size": None}
@@ -559,15 +749,18 @@ class ScanWorker(QThread):
                             prf_data = read_prf(prf_path)
                     job_id = self.db.upsert_job(
                         job_number, job_name_str, sub_job,
-                        prf_data["catalog_no"], prf_data["enclosure_size"], prf_path
+                        prf_data["catalog_no"], prf_data["enclosure_size"],
+                        prf_path, is_archived=1 if is_archived else 0
                     )
                     new_jobs += 1
 
-                # Step 4: enumerate all sldprt/sldasm in this folder
+                # Step 4: enumerate all sldprt/sldasm in this folder.
+                # Only scan the immediate folder (no recursion) — archive sub-folders
+                # are handled by the is_archived flag already set above.
                 self.progress.emit(pct, f"Scanning {job_number}/{sub_job}…")
                 try:
                     files = [f for f in folder.iterdir()
-                             if f.suffix.lower() in (".sldprt", ".sldasm")]
+                             if f.is_file() and f.suffix.lower() in (".sldprt", ".sldasm")]
                 except Exception:
                     continue
 
@@ -578,7 +771,6 @@ class ScanWorker(QThread):
                     cat_code = m.group(1)
                     five_dig = m.group(2)   # 5-digit ID, e.g. "90015"
                     file_ext = m.group(3).lower()
-                    # All files in this folder belong to this user — no prefix filtering
                     part_num = f"{cat_code}-{five_dig}"
                     cat_name = CATEGORIES.get(cat_code, "Unknown")
                     self.db.upsert_part(
@@ -688,11 +880,14 @@ class ScanDialog(QDialog):
 
 # ── Setup Dialog ───────────────────────────────────────────────────────────
 class SetupDialog(QDialog):
-    def __init__(self, parent=None, prefill_id=""):
+    def __init__(self, parent=None, prefill_id="", prefill_cats=None):
         super().__init__(parent)
         self.setWindowTitle("Parts Tracker — Setup")
-        self.setFixedSize(420, 230)
+        self.setMinimumWidth(460)
         self.setModal(True)
+
+        self._prefill_cats = prefill_cats or {}
+        self._cat_inputs: Dict[str, QLineEdit] = {}
 
         ly = QVBoxLayout(self)
         ly.setContentsMargins(36, 28, 36, 28)
@@ -703,18 +898,19 @@ class SetupDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ly.addWidget(title)
 
-        sub = QLabel("Enter your SolidWorks user ID (single digit).")
+        sub = QLabel("Enter your SolidWorks user ID.")
         sub.setObjectName("lbl_sub")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ly.addWidget(sub)
 
+        # ── Main ID form ──
         form = QFormLayout()
         form.setSpacing(10)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.id_inp = QLineEdit(prefill_id)
-        self.id_inp.setPlaceholderText("e.g.  9  or  51")
-        self.id_inp.setMaxLength(3)
+        self.id_inp.setPlaceholderText("e.g.  9  or  51  or  801")
+        self.id_inp.setMaxLength(4)
         form.addRow("User ID:", self.id_inp)
 
         self.preview = QLabel("")
@@ -722,28 +918,107 @@ class SetupDialog(QDialog):
         form.addRow("Search prefix:", self.preview)
         self.id_inp.textChanged.connect(self._update_preview)
         self._update_preview()
-
         ly.addLayout(form)
 
+        # ── More Options toggle ──
+        self._more_btn = QPushButton("▶   More Options  —  per-category ID overrides")
+        self._more_btn.setCheckable(True)
+        self._more_btn.setChecked(False)
+        self._more_btn.setStyleSheet(
+            "QPushButton { text-align:left; padding:6px 10px;"
+            " background:#24273a; border:1px solid #45475a; border-radius:6px;"
+            " color:#a6adc8; font-size:12px; }"
+            "QPushButton:hover { background:#313244; }"
+            "QPushButton:checked { color:#89b4fa; border-color:#89b4fa; }"
+        )
+        self._more_btn.clicked.connect(self._toggle_more)
+        ly.addWidget(self._more_btn)
+
+        # ── Expandable section ──
+        self._more_widget = QWidget()
+        more_ly = QVBoxLayout(self._more_widget)
+        more_ly.setContentsMargins(4, 0, 4, 0)
+        more_ly.setSpacing(8)
+
+        note = QLabel(
+            "If you were assigned a different ID for specific categories, enter it here.\n"
+            "Leave blank to use the main User ID above."
+        )
+        note.setObjectName("lbl_sub")
+        note.setWordWrap(True)
+        more_ly.addWidget(note)
+
+        cat_form = QFormLayout()
+        cat_form.setSpacing(8)
+        cat_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        for code, name in CATEGORIES.items():
+            if code == "003":
+                continue
+            inp = QLineEdit(self._prefill_cats.get(code, ""))
+            inp.setMaxLength(4)
+            inp.setPlaceholderText("same as main")
+            cat_form.addRow(f"{code}  {name}:", inp)
+            self._cat_inputs[code] = inp
+        more_ly.addLayout(cat_form)
+
+        self._more_widget.setVisible(False)
+        ly.addWidget(self._more_widget)
+
+        # ── Save button ──
         btn = QPushButton("Save && Continue")
         btn.setObjectName("primary")
         btn.clicked.connect(self._ok)
         ly.addWidget(btn)
 
+        # Expand automatically if any overrides are already saved
+        if any(self._prefill_cats.get(c) for c in self._cat_inputs):
+            self._more_btn.setChecked(True)
+            self._toggle_more(True)
+
+        self.adjustSize()
+
+    def _toggle_more(self, checked: bool):
+        self._more_btn.setText(
+            "▼   More Options  —  per-category ID overrides" if checked
+            else "▶   More Options  —  per-category ID overrides"
+        )
+        self._more_widget.setVisible(checked)
+        self.adjustSize()
+
     def _update_preview(self):
         uid = self.id_inp.text().strip()
         pad = "X" * (5 - len(uid))
-        self.preview.setText(f"###-{uid}{pad}   (e.g. 003-{uid}{pad})" if uid.isdigit() else "")
+        self.preview.setText(
+            f"###-{uid}{pad}   (e.g. 003-{uid}{pad})" if uid.isdigit() else ""
+        )
+        # Update placeholders to reflect the current main ID
+        for inp in self._cat_inputs.values():
+            inp.setPlaceholderText(f"default: {uid}" if uid.isdigit() else "same as main")
 
     def _ok(self):
-        if not self.id_inp.text().strip().isdigit():
+        uid = self.id_inp.text().strip()
+        if not uid.isdigit():
             QMessageBox.warning(self, "Invalid", "User ID must be a number.")
             return
+        # Validate any category overrides entered
+        for code, inp in self._cat_inputs.items():
+            v = inp.text().strip()
+            if v and not v.isdigit():
+                QMessageBox.warning(
+                    self, "Invalid",
+                    f"Override for category {code} must be a number (or leave blank)."
+                )
+                return
         self.accept()
 
     def values(self):
         uid = self.id_inp.text().strip()
-        return {"user_id": uid, "user_prefix": uid}
+        cat_prefixes = {}
+        for code, inp in self._cat_inputs.items():
+            v = inp.text().strip()
+            if v and v.isdigit():
+                cat_prefixes[code] = v
+        return {"user_id": uid, "user_prefix": uid, "cat_prefixes": cat_prefixes}
 
 
 # ── Parts Table ────────────────────────────────────────────────────────────
@@ -776,9 +1051,16 @@ class PartsTable(QTableWidget):
     def load(self, rows):
         self.setUpdatesEnabled(False)
         self.setRowCount(0)
+        _archived_bg = QColor("#2a2000")
+        _archived_fg = QColor("#f9e2af")
         for r, p in enumerate(rows):
             self.insertRow(r)
             self.setRowHeight(r, 30)
+            # Highlight only if THIS specific file lives inside an "archive" folder
+            archived = any(
+                part.lower() == "archive"
+                for part in Path(p["full_path"]).parts
+            )
             job_str = f"{p['job_number']} {p['job_name'] or ''}".strip()
             vals = [
                 p["part_number"],
@@ -792,6 +1074,9 @@ class PartsTable(QTableWidget):
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                if archived:
+                    item.setBackground(_archived_bg)
+                    item.setForeground(_archived_fg)
                 self.setItem(r, c, item)
             btn = QPushButton("Open")
             btn.setObjectName("btn_open")
@@ -928,9 +1213,15 @@ class MyPartsTab(QWidget):
         self._cur_job_id = data["id"]
         self.parts_title.setText(f"{data['sub_job']}  —  {data['job_name'] or ''}")
         info = []
-        if data.get("catalog_no"):    info.append(f"Catalog: {data['catalog_no']}")
+        if data.get("catalog_no"):     info.append(f"Catalog: {data['catalog_no']}")
         if data.get("enclosure_size"): info.append(f"Size: {data['enclosure_size']}")
+        if data.get("is_archived"):    info.append("⚠ Parts Archived")
         self.info_lbl.setText("   ·   ".join(info) if info else "No PRF data found")
+        # Colour the archived warning in amber
+        if data.get("is_archived"):
+            self.info_lbl.setStyleSheet("color:#f9e2af; font-size:12px;")
+        else:
+            self.info_lbl.setStyleSheet("")
         self._load_parts()
 
     def _load_parts(self):
@@ -1122,12 +1413,18 @@ class JobsTab(QWidget):
                 scanned = datetime.fromisoformat(scanned).strftime("%Y-%m-%d") if scanned else ""
             except Exception:
                 pass
-            vals = [job["job_number"], job["sub_job"], job["job_name"] or "",
+            archived = bool(job["is_archived"]) if "is_archived" in job.keys() else False
+            job_name_display = job["job_name"] or ""
+            if archived:
+                job_name_display = f"{job_name_display}  [Archived]".strip()
+            vals = [job["job_number"], job["sub_job"], job_name_display,
                     job["catalog_no"] or "—", job["enclosure_size"] or "—",
                     str(job["part_count"]), scanned]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                if archived:
+                    item.setForeground(QColor("#f9e2af"))
                 self.tbl.setItem(r, c, item)
             # Open folder button
             btn = QPushButton("Open")
@@ -1204,11 +1501,13 @@ def _next_part(user_prefix: str, cat_code: str, latest: str) -> str:
 
 
 class NextNumbersTab(QWidget):
-    def __init__(self, db: Database, user_prefix: str):
+    def __init__(self, db: Database, user_prefix: str, cat_prefixes: Dict[str, str] = None):
         super().__init__()
-        self.db          = db
-        self.user_prefix = user_prefix
-        self._cards: Dict[str, dict] = {}   # cat_code -> {latest_lbl, next_lbl}
+        self.db           = db
+        self.user_prefix  = user_prefix
+        self.cat_prefixes = cat_prefixes or {}
+        self._cards: Dict[str, dict] = {}   # cat_code -> {latest_lbl, next_lbl, gap_lbl}
+        self._cached_gaps = None  # populated on first verify (tab-open / scan-done)
         self._build()
 
         self._poll_timer = QTimer(self)
@@ -1319,24 +1618,99 @@ class NextNumbersTab(QWidget):
         next_row.addWidget(copy_btn)
         ly.addLayout(next_row)
 
+        # Gap section — hidden until gaps are found
+        gap_section = QWidget()
+        gap_section.setVisible(False)
+        gsl = QVBoxLayout(gap_section)
+        gsl.setContentsMargins(0, 4, 0, 0)
+        gsl.setSpacing(3)
+
+        gap_toggle = QPushButton("")
+        gap_toggle.setFlat(True)
+        gap_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        gap_toggle.setStyleSheet(
+            "QPushButton { background:transparent; color:#f9e2af; border:none;"
+            " font-size:11px; text-align:left; padding:0 2px; }"
+            "QPushButton:hover { color:#fde68a; }"
+        )
+        gsl.addWidget(gap_toggle)
+
+        gap_detail = QLabel("")
+        gap_detail.setStyleSheet(
+            "color:#a89060; font-size:11px; padding-left:14px; padding-top:2px;"
+        )
+        gap_detail.setWordWrap(True)
+        gap_detail.setVisible(False)
+        gsl.addWidget(gap_detail)
+
+        self._cards[code]["gap_section"] = gap_section
+        self._cards[code]["gap_toggle"]  = gap_toggle
+        self._cards[code]["gap_detail"]  = gap_detail
+        gap_toggle.clicked.connect(
+            lambda _, btn=gap_toggle, det=gap_detail: self._toggle_gap(btn, det)
+        )
+        ly.addWidget(gap_section)
+
         return card
+
+    def _toggle_gap(self, btn: QPushButton, detail: QLabel):
+        expanding = not detail.isVisible()
+        detail.setVisible(expanding)
+        txt = btn.text()
+        if expanding:
+            btn.setText(txt.replace("▶", "▼", 1))
+        else:
+            btn.setText(txt.replace("▼", "▶", 1))
 
     def _copy(self, text: str):
         if text and text != "—":
             QApplication.clipboard().setText(text)
 
-    def refresh(self, user_prefix: str = None):
+    def refresh(self, user_prefix: str = None, cat_prefixes: Dict[str, str] = None,
+                verify: bool = False):
         if user_prefix:
             self.user_prefix = user_prefix
-        rows = self.db.latest_by_category()
-        # Build lookup by cat_code
-        existing = {r["category_code"]: r["latest_part"] for r in rows}
+        if cat_prefixes is not None:
+            self.cat_prefixes = cat_prefixes
+
+        rows = self.db.latest_by_category(self.user_prefix, self.cat_prefixes)
+        existing = {r["category_code"]: r for r in rows}
+
+        if self.user_prefix:
+            if verify:
+                # Query Everything directly — only on tab-open / scan-done
+                self._cached_gaps = find_gaps_via_everything(
+                    self.user_prefix, self.cat_prefixes
+                )
+            gaps = self._cached_gaps if self._cached_gaps is not None else {}
+        else:
+            gaps = {}
 
         for code in self._cards:
-            latest = existing.get(code, "")
-            nxt    = _next_part(self.user_prefix, code, latest)
+            row      = existing.get(code)
+            latest   = row["latest_part"] if row else ""
+            # Use the category-specific prefix for next-number calculation
+            eff_pfx  = self.cat_prefixes.get(code, self.user_prefix)
+            nxt      = _next_part(eff_pfx, code, latest)
             self._cards[code]["latest_lbl"].setText(latest if latest else "None yet")
             self._cards[code]["next_lbl"].setText(nxt)
+
+            gap_section = self._cards[code].get("gap_section")
+            gap_toggle  = self._cards[code].get("gap_toggle")
+            gap_detail  = self._cards[code].get("gap_detail")
+            if gap_section and gap_toggle and gap_detail:
+                gap_list = gaps.get(code, [])
+                if gap_list:
+                    n = len(gap_list)
+                    label = "gap" if n == 1 else "gaps"
+                    gap_toggle.setText(f"▶  {n} {label}  —  click to view")
+                    gap_detail.setText("   ".join(gap_list))
+                    gap_section.setVisible(True)
+                    # Reset to collapsed whenever data refreshes
+                    gap_detail.setVisible(False)
+                    gap_toggle.setText(gap_toggle.text().replace("▼", "▶", 1))
+                else:
+                    gap_section.setVisible(False)
 
 
 # ── Utility ────────────────────────────────────────────────────────────────
@@ -1350,11 +1724,13 @@ def open_path(path: str, folder: bool = False):
 
 # ── Main Window ────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
-    def __init__(self, db: Database, user_name: str, user_prefix: str):
+    def __init__(self, db: Database, user_name: str, user_prefix: str,
+                 cat_prefixes: Dict[str, str] = None):
         super().__init__()
-        self.db          = db
-        self.user_name   = user_name
-        self.user_prefix = user_prefix
+        self.db           = db
+        self.user_name    = user_name
+        self.user_prefix  = user_prefix
+        self.cat_prefixes = cat_prefixes or {}
         self._scan_dlg      = None
         self._worker        = None
         self._rescan_worker = None
@@ -1433,7 +1809,7 @@ class MainWindow(QMainWindow):
         self.tab_my    = MyPartsTab(self.db, self.user_prefix)
         self.tab_all   = AllPartsTab(self.db, self.user_prefix)
         self.tab_jobs  = JobsTab(self.db)
-        self.tab_next  = NextNumbersTab(self.db, self.user_prefix)
+        self.tab_next  = NextNumbersTab(self.db, self.user_prefix, self.cat_prefixes)
 
         self.tabs.addTab(self.tab_my,   f"  My Parts ({self.user_prefix})  ")
         self.tabs.addTab(self.tab_all,  "  All Parts  ")
@@ -1510,31 +1886,41 @@ class MainWindow(QMainWindow):
 
     def _tab_changed(self, index: int):
         if self.tabs.widget(index) is self.tab_next:
-            self.tab_next.refresh(self.user_prefix)
+            # User explicitly opened the tab — verify gaps against Everything
+            self.tab_next.refresh(self.user_prefix, self.cat_prefixes, verify=True)
 
     def _reload_tabs(self):
         self.tab_my.refresh(self.user_prefix)
         self.tab_all.refresh(self.user_prefix)
         self.tab_jobs.refresh()
-        self.tab_next.refresh(self.user_prefix)
+        # After a scan completes, re-verify gaps with Everything
+        self.tab_next.refresh(self.user_prefix, self.cat_prefixes, verify=True)
         self.tabs.setTabText(0, f"  My Parts ({self.user_prefix})  ")
 
     def _change_user(self):
-        dlg = SetupDialog(self, prefill_id=self.user_prefix if self.user_prefix else "")
+        dlg = SetupDialog(self,
+                          prefill_id=self.user_prefix if self.user_prefix else "",
+                          prefill_cats=self.cat_prefixes)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         v = dlg.values()
-        new_prefix = v["user_prefix"]
-        if new_prefix == self.user_prefix:
-            return  # nothing changed
-        self.user_prefix = new_prefix
+        new_prefix     = v["user_prefix"]
+        new_cat_pfx    = v["cat_prefixes"]
+        prefix_changed = (new_prefix != self.user_prefix)
+        self.user_prefix  = new_prefix
+        self.cat_prefixes = new_cat_pfx
         self.db.put("user_id",     v["user_id"])
         self.db.put("user_prefix", self.user_prefix)
-        self.user_lbl.setText(f"{self.user_name}  (prefix: {self.user_prefix})")
-        # Clear old user's data and scan fresh for the new user
-        self.db.clear_all()
+        self.db.set_cat_prefixes(self.cat_prefixes)
+        self.user_lbl.setText(
+            f"Logged in as  {self.user_name}  (prefix: {self.user_prefix})"
+        )
+        if prefix_changed:
+            # Main ID changed — clear and re-scan for the new user
+            self.db.clear_all()
         self._reload_tabs()
-        self._start_scan()
+        if prefix_changed:
+            self._start_scan()
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────
@@ -1560,11 +1946,14 @@ def main():
         user_prefix = v["user_prefix"]
         db.put("user_id",     user_id)
         db.put("user_prefix", user_prefix)
+        db.set_cat_prefixes(v["cat_prefixes"])
 
     if not user_prefix:
         user_prefix = user_id
 
-    win = MainWindow(db, user_name, user_prefix)
+    cat_prefixes = db.get_cat_prefixes()
+
+    win = MainWindow(db, user_name, user_prefix, cat_prefixes)
     win.show()
     sys.exit(app.exec())
 

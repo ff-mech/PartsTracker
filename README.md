@@ -29,25 +29,43 @@ A lightweight desktop app that combines **Everything's HTTP API** with **PRF Exc
 
 ## Setup
 
-**1. Install dependencies**
+**1. Create and activate a virtual environment**
+
+```bash
+python -m venv venv
+```
+
+Windows:
+```bash
+venv\Scripts\activate
+```
+
+macOS/Linux:
+```bash
+source venv/bin/activate
+```
+
+**2. Install dependencies**
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**2. Enable Everything HTTP Server**
+**3. Enable Everything HTTP Server**
 
 ```
 Everything → Tools → Options → HTTP Server → Enable (port 8080)
 ```
 
-**3. Run**
+**4. Run**
 
 ```bash
 python parts_tracker.py
 ```
 
 Or double-click `run.bat`.
+
+> **Note:** Always activate the virtual environment before running (`venv\Scripts\activate`).
 
 ---
 
@@ -76,6 +94,14 @@ The SQLite database is stored at:
 ```
 
 No installation required — just run and go.
+
+---
+
+## Known Issues
+
+| # | Area | Description |
+|---|---|---|
+| 1 | **Gap Checker** | The missing-number detection on the Next Numbers tab queries Everything to verify gaps, but the results are not always accurate — some numbers that genuinely exist on disk may still appear as gaps, or the check may not run if Everything is slow to respond. This is under investigation. |
 
 ---
 
