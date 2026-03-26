@@ -1500,19 +1500,37 @@ def _next_part(user_prefix: str, cat_code: str, latest: str) -> str:
     return f"{cat_code}-{nxt}"
 
 
+class GapScanWorker(QThread):
+    finished = pyqtSignal(dict)
+
+    def __init__(self, user_prefix: str, cat_prefixes: Dict[str, str]):
+        super().__init__()
+        self.user_prefix  = user_prefix
+        self.cat_prefixes = cat_prefixes
+
+    def run(self):
+        result = find_gaps_via_everything(self.user_prefix, self.cat_prefixes)
+        self.finished.emit(result)
+
+
 class NextNumbersTab(QWidget):
     def __init__(self, db: Database, user_prefix: str, cat_prefixes: Dict[str, str] = None):
         super().__init__()
         self.db           = db
         self.user_prefix  = user_prefix
         self.cat_prefixes = cat_prefixes or {}
-        self._cards: Dict[str, dict] = {}   # cat_code -> {latest_lbl, next_lbl, gap_lbl}
-        self._cached_gaps = None  # populated on first verify (tab-open / scan-done)
+        self._cards: Dict[str, dict] = {}
+        self._cached_gaps = None
+        self._gap_worker: Optional[GapScanWorker] = None
         self._build()
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._safe_refresh)
-        self._poll_timer.start(5_000)    # refresh every 5 seconds
+        self._poll_timer.start(5_000)
+
+        # Auto-scan gaps on startup
+        if self.user_prefix:
+            QTimer.singleShot(300, self._start_gap_scan)
 
     def _safe_refresh(self):
         try:
@@ -1554,7 +1572,114 @@ class NextNumbersTab(QWidget):
             self.grid.addWidget(card, idx // 3, idx % 3)
 
         outer.addWidget(grid_widget)
+
+        self._gap_panel = self._build_gap_section()
+        outer.addWidget(self._gap_panel)
         outer.addStretch()
+
+    def _build_gap_section(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("gap_panel")
+        panel.setStyleSheet(
+            "QFrame#gap_panel { background:#181825; border:1px solid #313244; border-radius:8px; }"
+        )
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(16, 14, 16, 14)
+        pl.setSpacing(0)
+
+        # Header row
+        hdr = QHBoxLayout()
+        hdr.setSpacing(10)
+        title = QLabel("Gap Analysis")
+        title.setStyleSheet("font-size:14px; font-weight:bold; color:#f9e2af;")
+        hdr.addWidget(title)
+        self._gap_status_lbl = QLabel("Pending — scan or open tab to check")
+        self._gap_status_lbl.setStyleSheet("font-size:11px; color:#585b70;")
+        hdr.addWidget(self._gap_status_lbl)
+        hdr.addStretch()
+        self._gap_scan_btn = QPushButton("Scan Gaps")
+        self._gap_scan_btn.setStyleSheet(
+            "QPushButton { background:#f9e2af; color:#1e1e2e; border:none; border-radius:5px;"
+            " font-size:11px; font-weight:bold; padding:4px 12px; }"
+            "QPushButton:hover { background:#fde68a; }"
+            "QPushButton:disabled { background:#45475a; color:#585b70; }"
+        )
+        self._gap_scan_btn.clicked.connect(self._scan_gaps_now)
+        hdr.addWidget(self._gap_scan_btn)
+        pl.addLayout(hdr)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background:#313244; max-height:1px; margin-top:10px; margin-bottom:6px;")
+        pl.addWidget(sep)
+
+        # Per-category rows (hidden until gaps are loaded)
+        self._gap_rows: Dict[str, dict] = {}
+        for code, name in CATEGORIES.items():
+            if code == "003":
+                continue
+            color = CAT_COLORS.get(code, "#cdd6f4")
+            row_w = self._make_gap_row(code, name, color)
+            pl.addWidget(row_w)
+
+        return panel
+
+    def _make_gap_row(self, code: str, name: str, color: str) -> QWidget:
+        container = QWidget()
+        cl = QVBoxLayout(container)
+        cl.setContentsMargins(0, 1, 0, 1)
+        cl.setSpacing(0)
+
+        toggle = QPushButton(f"  {name}  ({code})")
+        toggle.setFlat(True)
+        toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        cl.addWidget(toggle)
+
+        detail = QLabel()
+        detail.setWordWrap(True)
+        detail.setVisible(False)
+        detail.setStyleSheet(
+            "color:#a6adc8; font-size:11px; padding:4px 6px 8px 28px;"
+            " font-family:'Consolas','Courier New',monospace;"
+        )
+        cl.addWidget(detail)
+
+        toggle.clicked.connect(lambda _, t=toggle, d=detail: self._toggle_gap_row(t, d))
+        self._gap_rows[code] = {"container": container, "toggle": toggle, "detail": detail, "color": color}
+        container.setVisible(False)
+        return container
+
+    def _toggle_gap_row(self, toggle: QPushButton, detail: QLabel):
+        expanding = not detail.isVisible()
+        detail.setVisible(expanding)
+        txt = toggle.text()
+        if expanding:
+            toggle.setText(txt.replace("▶", "▼", 1))
+        else:
+            toggle.setText(txt.replace("▼", "▶", 1))
+
+    def _start_gap_scan(self):
+        if self._gap_worker and self._gap_worker.isRunning():
+            return
+        if not self.user_prefix:
+            return
+        self._gap_status_lbl.setText("Scanning Everything…")
+        self._gap_status_lbl.setStyleSheet("font-size:11px; color:#89b4fa;")
+        self._gap_scan_btn.setEnabled(False)
+        worker = GapScanWorker(self.user_prefix, self.cat_prefixes)
+        worker.finished.connect(self._on_gap_scan_done)
+        worker.finished.connect(worker.deleteLater)
+        self._gap_worker = worker
+        worker.start()
+
+    def _on_gap_scan_done(self, result: dict):
+        self._cached_gaps = result
+        self._gap_worker = None
+        self._gap_scan_btn.setEnabled(True)
+        self.refresh()
+
+    def _scan_gaps_now(self):
+        self._start_gap_scan()
 
     def _make_card(self, code: str, name: str, color: str) -> QFrame:
         card = QFrame()
@@ -1603,6 +1728,14 @@ class NextNumbersTab(QWidget):
         self._cards[code]["next_lbl"] = next_val
         self._cards[code]["code"]     = code
 
+        gap_badge = QLabel("GAP")
+        gap_badge.setStyleSheet(
+            "background:#f9e2af; color:#1e1e2e; font-size:10px; font-weight:bold;"
+            " border-radius:3px; padding:1px 5px;"
+        )
+        gap_badge.setVisible(False)
+        self._cards[code]["gap_badge"] = gap_badge
+
         copy_btn = QPushButton("Copy")
         copy_btn.setFixedSize(52, 24)
         copy_btn.setStyleSheet(
@@ -1610,64 +1743,33 @@ class NextNumbersTab(QWidget):
             f" border-radius:4px; font-size:11px; padding:0; }}"
             f"QPushButton:hover {{ background:{color}; color:#1e1e2e; }}"
         )
-        copy_btn.clicked.connect(lambda _, lbl=next_val: self._copy(lbl.text()))
+        copy_btn.clicked.connect(lambda _, lbl=next_val, c=code: self._copy_next(lbl.text(), c))
 
         next_row.addWidget(next_title)
         next_row.addWidget(next_val)
+        next_row.addSpacing(6)
+        next_row.addWidget(gap_badge)
         next_row.addStretch()
         next_row.addWidget(copy_btn)
         ly.addLayout(next_row)
 
-        # Gap section — hidden until gaps are found
-        gap_section = QWidget()
-        gap_section.setVisible(False)
-        gsl = QVBoxLayout(gap_section)
-        gsl.setContentsMargins(0, 4, 0, 0)
-        gsl.setSpacing(3)
-
-        gap_toggle = QPushButton("")
-        gap_toggle.setFlat(True)
-        gap_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        gap_toggle.setStyleSheet(
-            "QPushButton { background:transparent; color:#f9e2af; border:none;"
-            " font-size:11px; text-align:left; padding:0 2px; }"
-            "QPushButton:hover { color:#fde68a; }"
-        )
-        gsl.addWidget(gap_toggle)
-
-        gap_detail = QLabel("")
-        gap_detail.setStyleSheet(
-            "color:#a89060; font-size:11px; padding-left:14px; padding-top:2px;"
-        )
-        gap_detail.setWordWrap(True)
-        gap_detail.setVisible(False)
-        gsl.addWidget(gap_detail)
-
-        self._cards[code]["gap_section"] = gap_section
-        self._cards[code]["gap_toggle"]  = gap_toggle
-        self._cards[code]["gap_detail"]  = gap_detail
-        gap_toggle.clicked.connect(
-            lambda _, btn=gap_toggle, det=gap_detail: self._toggle_gap(btn, det)
-        )
-        ly.addWidget(gap_section)
-
         return card
 
-    def _toggle_gap(self, btn: QPushButton, detail: QLabel):
-        expanding = not detail.isVisible()
-        detail.setVisible(expanding)
-        txt = btn.text()
-        if expanding:
-            btn.setText(txt.replace("▶", "▼", 1))
-        else:
-            btn.setText(txt.replace("▼", "▶", 1))
+    def _copy_next(self, text: str, code: str):
+        if not text or text == "—":
+            return
+        QApplication.clipboard().setText(text)
+        # Remove used gap from cache so next gap (or latest+1) shows next
+        if self._cached_gaps and code in self._cached_gaps:
+            try:
+                self._cached_gaps[code].remove(text)
+            except ValueError:
+                pass
+            if not self._cached_gaps[code]:
+                del self._cached_gaps[code]
+        self.refresh()
 
-    def _copy(self, text: str):
-        if text and text != "—":
-            QApplication.clipboard().setText(text)
-
-    def refresh(self, user_prefix: str = None, cat_prefixes: Dict[str, str] = None,
-                verify: bool = False):
+    def refresh(self, user_prefix: str = None, cat_prefixes: Dict[str, str] = None):
         if user_prefix:
             self.user_prefix = user_prefix
         if cat_prefixes is not None:
@@ -1676,41 +1778,78 @@ class NextNumbersTab(QWidget):
         rows = self.db.latest_by_category(self.user_prefix, self.cat_prefixes)
         existing = {r["category_code"]: r for r in rows}
 
-        if self.user_prefix:
-            if verify:
-                # Query Everything directly — only on tab-open / scan-done
-                self._cached_gaps = find_gaps_via_everything(
-                    self.user_prefix, self.cat_prefixes
-                )
-            gaps = self._cached_gaps if self._cached_gaps is not None else {}
-        else:
-            gaps = {}
+        gaps = self._cached_gaps if self._cached_gaps is not None else {}
 
         for code in self._cards:
             row      = existing.get(code)
             latest   = row["latest_part"] if row else ""
-            # Use the category-specific prefix for next-number calculation
             eff_pfx  = self.cat_prefixes.get(code, self.user_prefix)
-            nxt      = _next_part(eff_pfx, code, latest)
+            gap_list = gaps.get(code, [])
+
+            if gap_list:
+                nxt      = gap_list[0]  # lowest missing number first
+                is_gap   = True
+            else:
+                nxt      = _next_part(eff_pfx, code, latest)
+                is_gap   = False
+
             self._cards[code]["latest_lbl"].setText(latest if latest else "None yet")
             self._cards[code]["next_lbl"].setText(nxt)
 
-            gap_section = self._cards[code].get("gap_section")
-            gap_toggle  = self._cards[code].get("gap_toggle")
-            gap_detail  = self._cards[code].get("gap_detail")
-            if gap_section and gap_toggle and gap_detail:
-                gap_list = gaps.get(code, [])
-                if gap_list:
-                    n = len(gap_list)
-                    label = "gap" if n == 1 else "gaps"
-                    gap_toggle.setText(f"▶  {n} {label}  —  click to view")
-                    gap_detail.setText("   ".join(gap_list))
-                    gap_section.setVisible(True)
-                    # Reset to collapsed whenever data refreshes
-                    gap_detail.setVisible(False)
-                    gap_toggle.setText(gap_toggle.text().replace("▼", "▶", 1))
-                else:
-                    gap_section.setVisible(False)
+            badge = self._cards[code].get("gap_badge")
+            if badge:
+                badge.setVisible(is_gap)
+
+        # ── Update gap panel ──
+        scanned = self._cached_gaps is not None
+        cats_with_gaps = 0
+        for code, row_info in self._gap_rows.items():
+            cat_name  = CATEGORIES.get(code, code)
+            color     = row_info["color"]
+            gap_list  = gaps.get(code, [])
+            toggle    = row_info["toggle"]
+            detail    = row_info["detail"]
+            container = row_info["container"]
+
+            if not scanned:
+                container.setVisible(False)
+                continue
+
+            # Preserve expanded/collapsed state across refreshes
+            was_expanded = detail.isVisible()
+
+            container.setVisible(True)
+            if gap_list:
+                cats_with_gaps += 1
+                n     = len(gap_list)
+                label = "gap" if n == 1 else "gaps"
+                toggle.setStyleSheet(
+                    f"QPushButton {{ background:transparent; color:{color}; border:none;"
+                    f" font-size:12px; font-weight:bold; text-align:left; padding:5px 4px; }}"
+                    f"QPushButton:hover {{ color:#cdd6f4; }}"
+                )
+                arrow = "▼" if was_expanded else "▶"
+                toggle.setText(f"{arrow}  {cat_name}  ({code})   —   {n} {label} missing")
+                detail.setText("  ".join(gap_list))
+                detail.setVisible(was_expanded)
+            else:
+                toggle.setStyleSheet(
+                    "QPushButton { background:transparent; color:#585b70; border:none;"
+                    " font-size:12px; text-align:left; padding:5px 4px; }"
+                )
+                toggle.setText(f"  ✓  {cat_name}  ({code})   —   no gaps")
+                detail.setVisible(False)
+
+        if scanned:
+            if cats_with_gaps:
+                self._gap_status_lbl.setText(f"{cats_with_gaps} categor{'y' if cats_with_gaps == 1 else 'ies'} with gaps")
+                self._gap_status_lbl.setStyleSheet("font-size:11px; color:#f9e2af;")
+            else:
+                self._gap_status_lbl.setText("All clear — no gaps found")
+                self._gap_status_lbl.setStyleSheet("font-size:11px; color:#a6e3a1;")
+        else:
+            self._gap_status_lbl.setText("Pending — scan or open tab to check")
+            self._gap_status_lbl.setStyleSheet("font-size:11px; color:#585b70;")
 
 
 # ── Utility ────────────────────────────────────────────────────────────────
@@ -1886,15 +2025,15 @@ class MainWindow(QMainWindow):
 
     def _tab_changed(self, index: int):
         if self.tabs.widget(index) is self.tab_next:
-            # User explicitly opened the tab — verify gaps against Everything
-            self.tab_next.refresh(self.user_prefix, self.cat_prefixes, verify=True)
+            self.tab_next.refresh(self.user_prefix, self.cat_prefixes)
+            self.tab_next._start_gap_scan()
 
     def _reload_tabs(self):
         self.tab_my.refresh(self.user_prefix)
         self.tab_all.refresh(self.user_prefix)
         self.tab_jobs.refresh()
-        # After a scan completes, re-verify gaps with Everything
-        self.tab_next.refresh(self.user_prefix, self.cat_prefixes, verify=True)
+        self.tab_next.refresh(self.user_prefix, self.cat_prefixes)
+        self.tab_next._start_gap_scan()
         self.tabs.setTabText(0, f"  My Parts ({self.user_prefix})  ")
 
     def _change_user(self):
