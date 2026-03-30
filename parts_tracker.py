@@ -238,6 +238,17 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_p_user ON parts(user_prefix);
             CREATE INDEX IF NOT EXISTS idx_p_job  ON parts(job_id);
             CREATE INDEX IF NOT EXISTS idx_p_cat  ON parts(category_code);
+
+            CREATE TABLE IF NOT EXISTS part_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                event       TEXT NOT NULL,
+                part_number TEXT NOT NULL,
+                full_path   TEXT NOT NULL,
+                job_id      INTEGER,
+                ts          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_h_ts ON part_history(ts);
+            CREATE INDEX IF NOT EXISTS idx_h_pn ON part_history(part_number);
         """)
         self.con.commit()
         # Migration: add is_archived to existing databases
@@ -282,6 +293,9 @@ class Database:
 
     def upsert_part(self, part_number, category_code, category_name,
                     user_prefix, file_ext, full_path, job_id):
+        is_new = not self.con.execute(
+            "SELECT 1 FROM parts WHERE full_path=?", (full_path,)
+        ).fetchone()
         self.con.execute("""
             INSERT INTO parts(part_number,category_code,category_name,
                               user_prefix,file_ext,full_path,job_id)
@@ -289,6 +303,12 @@ class Database:
             ON CONFLICT(full_path) DO UPDATE SET job_id=excluded.job_id
         """, (part_number, category_code, category_name,
               user_prefix, file_ext, full_path, job_id))
+        if is_new:
+            self.con.execute(
+                "INSERT INTO part_history(event,part_number,full_path,job_id,ts)"
+                " VALUES(?,?,?,?,?)",
+                ("add", part_number, full_path, job_id, datetime.now().isoformat())
+            )
         self.con.commit()
 
     def get_jobs(self, search="", size_f="", cat_f=""):
@@ -837,8 +857,20 @@ class DirectoryRescanWorker(QThread):
                 "SELECT id, full_path FROM parts WHERE full_path LIKE ?",
                 (dir_str + "%",)
             ).fetchall()
-            missing = [r["id"] for r in db_rows if r["full_path"] not in disk_files]
+            missing_rows = [r for r in db_rows if r["full_path"] not in disk_files]
+            missing = [r["id"] for r in missing_rows]
             if missing:
+                for mrow in missing_rows:
+                    pr = self.db.con.execute(
+                        "SELECT part_number, job_id FROM parts WHERE id=?", (mrow["id"],)
+                    ).fetchone()
+                    if pr:
+                        self.db.con.execute(
+                            "INSERT INTO part_history(event,part_number,full_path,job_id,ts)"
+                            " VALUES(?,?,?,?,?)",
+                            ("remove", pr["part_number"], mrow["full_path"],
+                             pr["job_id"], datetime.now().isoformat())
+                        )
                 self.db.con.executemany("DELETE FROM parts WHERE id=?", [(i,) for i in missing])
                 self.db.con.commit()
 
@@ -1322,6 +1354,7 @@ class JobsTab(QWidget):
         super().__init__()
         self.db = db
         self._build()
+        self.export_btn.clicked.connect(lambda: export_jobs_excel(self.db, self))
 
     def _build(self):
         ly = QVBoxLayout(self)
@@ -1365,6 +1398,14 @@ class JobsTab(QWidget):
         clr = QPushButton("Clear")
         clr.clicked.connect(self._clear)
         fl.addWidget(clr)
+
+        self.export_btn = QPushButton("  Export Excel")
+        self.export_btn.setStyleSheet(
+            "QPushButton { background:#a6e3a1; color:#1e1e2e; font-weight:bold;"
+            " border:none; border-radius:6px; padding:6px 14px; }"
+            "QPushButton:hover { background:#94e2d5; }"
+        )
+        fl.addWidget(self.export_btn)
         ly.addWidget(fg)
 
         # Jobs table
@@ -1758,7 +1799,9 @@ class NextNumbersTab(QWidget):
     def _copy_next(self, text: str, code: str):
         if not text or text == "—":
             return
-        QApplication.clipboard().setText(text)
+        # Copy only the 5-digit numeric part (e.g. "90015" from "200-90015")
+        num_only = text.split("-", 1)[1] if "-" in text else text
+        QApplication.clipboard().setText(num_only)
         # Remove used gap from cache so next gap (or latest+1) shows next
         if self._cached_gaps and code in self._cached_gaps:
             try:
@@ -1850,6 +1893,742 @@ class NextNumbersTab(QWidget):
         else:
             self._gap_status_lbl.setText("Pending — scan or open tab to check")
             self._gap_status_lbl.setStyleSheet("font-size:11px; color:#585b70;")
+
+
+# ── History Tab ────────────────────────────────────────────────────────────
+class HistoryTab(QWidget):
+    def __init__(self, db: Database):
+        super().__init__()
+        self.db = db
+        self._build()
+
+    def _build(self):
+        ly = QVBoxLayout(self)
+        ly.setContentsMargins(10, 10, 10, 10)
+        ly.setSpacing(8)
+
+        hr = QHBoxLayout()
+        lbl = QLabel("Part History")
+        lbl.setObjectName("lbl_header")
+        hr.addWidget(lbl)
+        sub = QLabel("Audit log of parts added and removed")
+        sub.setObjectName("lbl_sub")
+        hr.addWidget(sub)
+        hr.addStretch()
+
+        fg = QGroupBox("Filters")
+        fl_h = QHBoxLayout(fg)
+        fl_h.setSpacing(10)
+        self.search_inp = QLineEdit()
+        self.search_inp.setPlaceholderText("Search part number…")
+        self.search_inp.textChanged.connect(self.refresh)
+        fl_h.addWidget(self.search_inp, 2)
+        fl_h.addWidget(QLabel("Event:"))
+        self.evt_cb = QComboBox()
+        self.evt_cb.addItems(["All", "add", "remove"])
+        self.evt_cb.currentIndexChanged.connect(self.refresh)
+        fl_h.addWidget(self.evt_cb)
+        btn_clr = QPushButton("Clear")
+        btn_clr.clicked.connect(lambda: (self.search_inp.clear(),
+                                          self.evt_cb.setCurrentIndex(0)))
+        fl_h.addWidget(btn_clr)
+
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("lbl_sub")
+        hr.addWidget(self.count_lbl)
+        ly.addLayout(hr)
+        ly.addWidget(fg)
+
+        HCOLS = ["Timestamp", "Event", "Part Number", "Job ID", "Full Path"]
+        self.tbl = QTableWidget()
+        self.tbl.setColumnCount(len(HCOLS))
+        self.tbl.setHorizontalHeaderLabels(HCOLS)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setShowGrid(False)
+        self.tbl.verticalHeader().setVisible(False)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        ly.addWidget(self.tbl)
+        self.refresh()
+
+    def refresh(self):
+        search = self.search_inp.text().strip() if hasattr(self, "search_inp") else ""
+        evt    = self.evt_cb.currentText()       if hasattr(self, "evt_cb")     else "All"
+        q    = "SELECT ts, event, part_number, job_id, full_path FROM part_history WHERE 1=1"
+        args = []
+        if search:
+            q += " AND part_number LIKE ?"
+            args.append(f"%{search}%")
+        if evt != "All":
+            q += " AND event=?"
+            args.append(evt)
+        q += " ORDER BY id DESC LIMIT 2000"
+        rows = self.db.con.execute(q, args).fetchall()
+
+        self.tbl.setUpdatesEnabled(False)
+        self.tbl.setRowCount(0)
+        ADD_FG = QColor("#a6e3a1")
+        REM_FG = QColor("#f38ba8")
+        for r, row in enumerate(rows):
+            self.tbl.insertRow(r)
+            self.tbl.setRowHeight(r, 28)
+            ts = row["ts"] or ""
+            try:
+                ts = datetime.fromisoformat(ts).strftime("%Y-%m-%d  %H:%M:%S")
+            except Exception:
+                pass
+            vals = [ts, row["event"], row["part_number"],
+                    str(row["job_id"] or "—"), row["full_path"]]
+            fg = ADD_FG if row["event"] == "add" else REM_FG
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                if c == 1:
+                    item.setForeground(fg)
+                self.tbl.setItem(r, c, item)
+        self.tbl.setUpdatesEnabled(True)
+        if hasattr(self, "count_lbl"):
+            self.count_lbl.setText(f"{len(rows):,} event(s)")
+
+
+# ── Orphan Scan Worker ─────────────────────────────────────────────────────
+class OrphanScanWorker(QThread):
+    """Finds parts on disk (via Everything) that are NOT in the local DB."""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(list)
+    err      = pyqtSignal(str)
+
+    def __init__(self, user_prefix: str, cat_prefixes: Dict[str, str] = None, mode: str = "orphans"):
+        super().__init__()
+        self.user_prefix  = user_prefix
+        self.cat_prefixes = cat_prefixes or {}
+        self.mode         = mode  # "orphans" or "archive"
+
+    def run(self):
+        try:
+            import requests
+            con = sqlite3.connect(str(DB_PATH), timeout=10)
+            con.row_factory = sqlite3.Row
+
+            session  = requests.Session()
+            orphans  = []
+            cats     = [c for c in CATEGORIES if c != "003"]
+            total    = len(cats)
+
+            for idx, cat_code in enumerate(cats):
+                pfx = self.cat_prefixes.get(cat_code, self.user_prefix)
+                if not pfx:
+                    continue
+                pct = int(100 * idx / total)
+                self.progress.emit(pct, f"Checking {CATEGORIES[cat_code]} ({cat_code})…")
+
+                hits = []
+                for ext in ("sldprt", "sldasm"):
+                    hits += _eq(session, f'"{cat_code}-{pfx}" ext:{ext} path:"{JOBS_ROOT}"')
+
+                for hit in hits:
+                    full = os.path.join(hit["path"], hit["name"])
+                    exists_in_db = con.execute(
+                        "SELECT 1 FROM parts WHERE full_path=?", (full,)
+                    ).fetchone()
+                    if not exists_in_db:
+                        is_in_archive = any(
+                            p.lower() == "archive"
+                            for p in Path(full).parts
+                        )
+                        if self.mode == "archive" and not is_in_archive:
+                            continue
+                        if self.mode == "orphans" and is_in_archive:
+                            continue
+                        m = PART_RE.match(hit["name"])
+                        orphans.append({
+                            "name":       hit["name"],
+                            "full_path":  full,
+                            "folder":     hit["path"],
+                            "cat_code":   cat_code,
+                            "cat_name":   CATEGORIES.get(cat_code, cat_code),
+                            "part_number": f"{cat_code}-{m.group(2)}" if m else hit["name"],
+                        })
+
+            con.close()
+            # Deduplicate by full path
+            seen, unique = set(), []
+            for o in orphans:
+                if o["full_path"] not in seen:
+                    seen.add(o["full_path"])
+                    unique.append(o)
+            self.progress.emit(100, "Done")
+            self.finished.emit(sorted(unique, key=lambda x: x["part_number"]))
+        except Exception as e:
+            self.err.emit(str(e))
+
+
+# ── Orphans Tab ────────────────────────────────────────────────────────────
+class OrphansTab(QWidget):
+    """Shows part files on disk that aren't in any scanned job folder."""
+
+    def __init__(self, db: Database, user_prefix: str,
+                 cat_prefixes: Dict[str, str] = None):
+        super().__init__()
+        self.db           = db
+        self.user_prefix  = user_prefix
+        self.cat_prefixes = cat_prefixes or {}
+        self._worker: Optional[OrphanScanWorker] = None
+        self._build()
+
+    def _build(self):
+        ly = QVBoxLayout(self)
+        ly.setContentsMargins(10, 10, 10, 10)
+        ly.setSpacing(8)
+
+        # Header row
+        hr = QHBoxLayout()
+        lbl = QLabel("Orphaned Parts")
+        lbl.setObjectName("lbl_header")
+        hr.addWidget(lbl)
+        hr.addStretch()
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("lbl_sub")
+        hr.addWidget(self.count_lbl)
+        self.scan_btn = QPushButton("  Scan for Orphans")
+        self.scan_btn.setObjectName("primary")
+        self.scan_btn.clicked.connect(self._start_scan)
+        hr.addWidget(self.scan_btn)
+        ly.addLayout(hr)
+
+        # Info strip
+        info = QFrame()
+        info.setObjectName("info_strip")
+        il = QHBoxLayout(info)
+        il.setContentsMargins(12, 6, 12, 6)
+        self.status_lbl = QLabel(
+            "Part files on disk that match your prefix but are not tracked in any scanned job folder, "
+            "excluding files inside 'archive' folders.  "
+            "These may be misplaced, in an un-scanned location, or left over from a deleted job."
+        )
+        self.status_lbl.setObjectName("lbl_sub")
+        self.status_lbl.setWordWrap(True)
+        il.addWidget(self.status_lbl)
+        ly.addWidget(info)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setVisible(False)
+        ly.addWidget(self.progress_bar)
+
+        # Results table
+        OCOLS = ["Part Number", "Category", "Type", "Folder", ""]
+        self.tbl = QTableWidget()
+        self.tbl.setColumnCount(len(OCOLS))
+        self.tbl.setHorizontalHeaderLabels(OCOLS)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setShowGrid(False)
+        self.tbl.verticalHeader().setVisible(False)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.tbl.setColumnWidth(4, 70)
+        ly.addWidget(self.tbl)
+
+    def _start_scan(self):
+        if self._worker and self._worker.isRunning():
+            return
+        self.scan_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.tbl.setRowCount(0)
+        self.count_lbl.setText("")
+
+        self._worker = OrphanScanWorker(self.user_prefix, self.cat_prefixes, mode="orphans")
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_done)
+        self._worker.err.connect(self._on_err)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
+    def _on_progress(self, pct: int, msg: str):
+        self.progress_bar.setValue(pct)
+        self.status_lbl.setText(msg)
+
+    def _on_err(self, msg: str):
+        self.scan_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_lbl.setText(f"Error: {msg}")
+
+    def _on_done(self, orphans: list):
+        self._worker = None
+        self.scan_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+        ORPHAN_FG = QColor("#f38ba8")
+        self.tbl.setUpdatesEnabled(False)
+        self.tbl.setRowCount(0)
+        for r, o in enumerate(orphans):
+            self.tbl.insertRow(r)
+            self.tbl.setRowHeight(r, 30)
+            ext = o["name"].rsplit(".", 1)[-1].upper() if "." in o["name"] else ""
+            vals = [
+                o["part_number"],
+                f"{o['cat_code']} – {o['cat_name']}",
+                ext,
+                o["folder"],
+            ]
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setForeground(ORPHAN_FG)
+                self.tbl.setItem(r, c, item)
+            btn = QPushButton("Open")
+            btn.setObjectName("btn_open")
+            btn.setFixedHeight(24)
+            fp = o["full_path"]
+            btn.clicked.connect(lambda _, x=fp: open_path(x))
+            self.tbl.setCellWidget(r, 4, btn)
+        self.tbl.setUpdatesEnabled(True)
+
+        n = len(orphans)
+        self.count_lbl.setText(f"{n:,} orphan(s)")
+        if n == 0:
+            self.status_lbl.setText(
+                "All clear — every matching part file is already tracked in a scanned job folder."
+            )
+            self.status_lbl.setStyleSheet("color:#a6e3a1; font-size:12px;")
+        else:
+            self.status_lbl.setText(
+                f"{n} untracked part file(s) found.  "
+                "These files exist on disk but aren't in any of your scanned job folders."
+            )
+            self.status_lbl.setStyleSheet("color:#f9e2af; font-size:12px;")
+
+    def refresh(self, user_prefix: str = None,
+                cat_prefixes: Dict[str, str] = None):
+        if user_prefix:
+            self.user_prefix = user_prefix
+        if cat_prefixes is not None:
+            self.cat_prefixes = cat_prefixes
+
+
+# ── Archive Tab ────────────────────────────────────────────────────────────
+class ArchiveTab(QWidget):
+    """Shows part files on disk that live inside an 'archive' folder."""
+
+    def __init__(self, db: Database, user_prefix: str,
+                 cat_prefixes: Dict[str, str] = None):
+        super().__init__()
+        self.db           = db
+        self.user_prefix  = user_prefix
+        self.cat_prefixes = cat_prefixes or {}
+        self._worker: Optional[OrphanScanWorker] = None
+        self._build()
+
+    def _build(self):
+        ly = QVBoxLayout(self)
+        ly.setContentsMargins(10, 10, 10, 10)
+        ly.setSpacing(8)
+
+        # Header row
+        hr = QHBoxLayout()
+        lbl = QLabel("Archived Parts")
+        lbl.setObjectName("lbl_header")
+        hr.addWidget(lbl)
+        hr.addStretch()
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("lbl_sub")
+        hr.addWidget(self.count_lbl)
+        self.scan_btn = QPushButton("  Scan for Archives")
+        self.scan_btn.setObjectName("primary")
+        self.scan_btn.clicked.connect(self._start_scan)
+        hr.addWidget(self.scan_btn)
+        ly.addLayout(hr)
+
+        # Info strip
+        info = QFrame()
+        info.setObjectName("info_strip")
+        il = QHBoxLayout(info)
+        il.setContentsMargins(12, 6, 12, 6)
+        self.status_lbl = QLabel(
+            "Part files on disk that match your prefix and live inside an 'archive' folder.  "
+            "These files are not tracked in any active scanned job folder."
+        )
+        self.status_lbl.setObjectName("lbl_sub")
+        self.status_lbl.setWordWrap(True)
+        il.addWidget(self.status_lbl)
+        ly.addWidget(info)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setVisible(False)
+        ly.addWidget(self.progress_bar)
+
+        # Results table
+        ACOLS = ["Part Number", "Category", "Type", "Folder", ""]
+        self.tbl = QTableWidget()
+        self.tbl.setColumnCount(len(ACOLS))
+        self.tbl.setHorizontalHeaderLabels(ACOLS)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setShowGrid(False)
+        self.tbl.verticalHeader().setVisible(False)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.tbl.setColumnWidth(4, 70)
+        ly.addWidget(self.tbl)
+
+    def _start_scan(self):
+        if self._worker and self._worker.isRunning():
+            return
+        self.scan_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.tbl.setRowCount(0)
+        self.count_lbl.setText("")
+
+        self._worker = OrphanScanWorker(self.user_prefix, self.cat_prefixes, mode="archive")
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_done)
+        self._worker.err.connect(self._on_err)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
+    def _on_progress(self, pct: int, msg: str):
+        self.progress_bar.setValue(pct)
+        self.status_lbl.setText(msg)
+
+    def _on_err(self, msg: str):
+        self.scan_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_lbl.setText(f"Error: {msg}")
+
+    def _on_done(self, archived: list):
+        self._worker = None
+        self.scan_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+        ARCHIVE_FG = QColor("#f9e2af")
+        ARCHIVE_BG = QColor("#2a2000")
+        self.tbl.setUpdatesEnabled(False)
+        self.tbl.setRowCount(0)
+        for r, o in enumerate(archived):
+            self.tbl.insertRow(r)
+            self.tbl.setRowHeight(r, 30)
+            ext = o["name"].rsplit(".", 1)[-1].upper() if "." in o["name"] else ""
+            vals = [
+                o["part_number"],
+                f"{o['cat_code']} – {o['cat_name']}",
+                ext,
+                o["folder"],
+            ]
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setBackground(ARCHIVE_BG)
+                item.setForeground(ARCHIVE_FG)
+                self.tbl.setItem(r, c, item)
+            btn = QPushButton("Open")
+            btn.setObjectName("btn_open")
+            btn.setFixedHeight(24)
+            fp = o["full_path"]
+            btn.clicked.connect(lambda _, x=fp: open_path(x))
+            self.tbl.setCellWidget(r, 4, btn)
+        self.tbl.setUpdatesEnabled(True)
+
+        n = len(archived)
+        self.count_lbl.setText(f"{n:,} archived file(s)")
+        if n == 0:
+            self.status_lbl.setText(
+                "No archived part files found matching your prefix."
+            )
+            self.status_lbl.setStyleSheet("color:#a6e3a1; font-size:12px;")
+        else:
+            self.status_lbl.setText(
+                f"{n} archived part file(s) found inside 'archive' folders."
+            )
+            self.status_lbl.setStyleSheet("color:#f9e2af; font-size:12px;")
+
+    def refresh(self, user_prefix: str = None,
+                cat_prefixes: Dict[str, str] = None):
+        if user_prefix:
+            self.user_prefix = user_prefix
+        if cat_prefixes is not None:
+            self.cat_prefixes = cat_prefixes
+
+
+# ── Excel Export ───────────────────────────────────────────────────────────
+def export_jobs_excel(db: Database, parent=None):
+    """Export all jobs to a formatted Excel workbook with per-job sheets."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        from PyQt6.QtWidgets import QFileDialog
+    except ImportError:
+        QMessageBox.critical(parent, "Missing Library",
+                             "openpyxl is required.\nRun: pip install openpyxl")
+        return
+
+    default_name = f"PartsTracker_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    path, _ = QFileDialog.getSaveFileName(
+        parent, "Export Jobs to Excel", default_name,
+        "Excel Workbook (*.xlsx)"
+    )
+    if not path:
+        return
+
+    jobs = db.get_jobs()
+    if not jobs:
+        QMessageBox.information(parent, "Export", "No jobs to export.")
+        return
+
+    # ── Catppuccin-dark palette ──────────────────────────────────────────
+    C_BG      = "1E1E2E"
+    C_MANTLE  = "181825"
+    C_SURFACE = "313244"
+    C_OVERLAY = "45475A"
+    C_BLUE    = "89B4FA"
+    C_GREEN   = "A6E3A1"
+    C_YELLOW  = "F9E2AF"
+    C_RED     = "F38BA8"
+    C_TEXT    = "CDD6F4"
+    C_SUBTEXT = "A6ADC8"
+
+    def mk_font(size=10, bold=False, color=C_TEXT, italic=False):
+        return Font(name="Segoe UI", size=size, bold=bold,
+                    color=color, italic=italic)
+
+    def mk_fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    thin  = Side(border_style="thin", color=C_SURFACE)
+    bdr   = Border(bottom=thin)
+    bdr_full = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left   = Alignment(horizontal="left",   vertical="center", wrap_text=False)
+    right  = Alignment(horizontal="right",  vertical="center")
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)   # remove the blank default sheet
+
+    # ════════════════════════════════════════════════════════════════════
+    # SUMMARY SHEET
+    # ════════════════════════════════════════════════════════════════════
+    ws = wb.create_sheet("Summary")
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    # Title banner
+    ws.merge_cells("A1:H1")
+    title_cell = ws["A1"]
+    title_cell.value     = "Parts Tracker  —  Job Export"
+    title_cell.font      = mk_font(size=16, bold=True, color=C_BLUE)
+    title_cell.fill      = mk_fill(C_MANTLE)
+    title_cell.alignment = left
+    ws.row_dimensions[1].height = 36
+
+    # Sub-title / export date
+    ws.merge_cells("A2:H2")
+    sub_cell = ws["A2"]
+    sub_cell.value     = f"Generated  {datetime.now().strftime('%B %d, %Y  at  %H:%M')}"
+    sub_cell.font      = mk_font(size=9, color=C_SUBTEXT, italic=True)
+    sub_cell.fill      = mk_fill(C_MANTLE)
+    sub_cell.alignment = left
+    ws.row_dimensions[2].height = 20
+
+    # Column headers
+    SUM_COLS = [
+        ("A", 13, "Job #"),
+        ("B", 16, "Sub-Job"),
+        ("C", 36, "Job Name"),
+        ("D", 20, "Catalog No"),
+        ("E", 20, "Enclosure Size"),
+        ("F", 10, "Parts"),
+        ("G", 12, "Archived"),
+        ("H", 14, "Scanned"),
+    ]
+    for col_letter, width, header in SUM_COLS:
+        ws.column_dimensions[col_letter].width = width
+        c = ws[f"{col_letter}3"]
+        c.value     = header
+        c.font      = mk_font(size=10, bold=True, color=C_BG)
+        c.fill      = mk_fill(C_BLUE)
+        c.alignment = center
+        c.border    = bdr_full
+    ws.row_dimensions[3].height = 22
+
+    # Job rows
+    for row_idx, job in enumerate(jobs, 4):
+        scanned = job["scanned_at"] or ""
+        try:
+            scanned = datetime.fromisoformat(scanned).strftime("%Y-%m-%d") if scanned else ""
+        except Exception:
+            pass
+        archived = bool(job["is_archived"]) if "is_archived" in job.keys() else False
+        band     = mk_fill(C_MANTLE) if row_idx % 2 == 0 else mk_fill(C_BG)
+        txt_color = C_YELLOW if archived else C_TEXT
+        row_vals  = [
+            job["job_number"], job["sub_job"], job["job_name"] or "",
+            job["catalog_no"] or "", job["enclosure_size"] or "",
+            job["part_count"], "Yes" if archived else "No", scanned,
+        ]
+        for c_idx, v in enumerate(row_vals):
+            col_letter = chr(ord("A") + c_idx)
+            cell = ws[f"{col_letter}{row_idx}"]
+            cell.value     = v
+            cell.font      = mk_font(size=10, color=txt_color)
+            cell.fill      = band
+            cell.alignment = center if c_idx in (5, 6) else left
+            cell.border    = bdr
+        ws.row_dimensions[row_idx].height = 20
+
+    # ════════════════════════════════════════════════════════════════════
+    # PER-JOB SHEETS
+    # ════════════════════════════════════════════════════════════════════
+    for job in jobs:
+        safe = re.sub(r'[\\/*?:\[\]]', "_", job["sub_job"])[:31]
+        ws = wb.create_sheet(safe)
+        ws.sheet_view.showGridLines = False
+
+        # ── PRF Header Block ──────────────────────────────────────────
+        # Row 1 — big title banner
+        ws.merge_cells("A1:F1")
+        c = ws["A1"]
+        c.value     = f"  {job['sub_job']}   —   {job['job_name'] or 'Unnamed Job'}"
+        c.font      = mk_font(size=15, bold=True, color=C_TEXT)
+        c.fill      = mk_fill(C_SURFACE)
+        c.alignment = left
+        ws.row_dimensions[1].height = 32
+
+        # PRF data rows (rows 2-7)
+        scanned_fmt = ""
+        try:
+            scanned_fmt = datetime.fromisoformat(
+                job["scanned_at"]).strftime("%Y-%m-%d  %H:%M") if job["scanned_at"] else ""
+        except Exception:
+            pass
+
+        prf_rows = [
+            ("Job Number",     job["job_number"],         C_BLUE),
+            ("Job Name",       job["job_name"] or "—",    C_TEXT),
+            ("Sub-Job",        job["sub_job"],             C_BLUE),
+            ("Catalog No",     job["catalog_no"] or "—",  C_GREEN),
+            ("Enclosure Size", job["enclosure_size"] or "—", C_YELLOW),
+            ("Scanned At",     scanned_fmt or "—",         C_SUBTEXT),
+        ]
+        for i, (label, value, val_color) in enumerate(prf_rows, 2):
+            # Label (col A)
+            lc = ws.cell(row=i, column=1, value=label)
+            lc.font      = mk_font(size=10, bold=True, color=C_SUBTEXT)
+            lc.fill      = mk_fill(C_MANTLE)
+            lc.alignment = right
+            # Value (col B-C merged)
+            ws.merge_cells(f"B{i}:C{i}")
+            vc = ws.cell(row=i, column=2, value=value)
+            vc.font      = mk_font(size=10, bold=True, color=val_color)
+            vc.fill      = mk_fill(C_BG)
+            vc.alignment = left
+            # Fill D-F as spacer
+            for col in (4, 5, 6):
+                ws.cell(row=i, column=col).fill = mk_fill(C_BG)
+            ws.row_dimensions[i].height = 20
+
+        # Archived warning badge (merged D2:F2)
+        archived = bool(job["is_archived"]) if "is_archived" in job.keys() else False
+        if archived:
+            ws.merge_cells("D2:F2")
+            ac = ws["D2"]
+            ac.value     = "  ⚠   ARCHIVED"
+            ac.font      = mk_font(size=11, bold=True, color=C_YELLOW)
+            ac.fill      = mk_fill("2A2000")
+            ac.alignment = center
+
+        # Spacer row
+        SPACER_ROW = len(prf_rows) + 2 + 1   # = 9
+        ws.row_dimensions[SPACER_ROW].height = 8
+        for col in range(1, 7):
+            ws.cell(row=SPACER_ROW, column=col).fill = mk_fill(C_BG)
+
+        # ── Parts Table ───────────────────────────────────────────────
+        HDR_ROW = SPACER_ROW + 1             # = 10
+        PART_COLS = [
+            (16, "Part Number"),
+            (28, "Category"),
+            (8,  "Type"),
+            (46, "File Name"),
+            (70, "Full Path"),
+        ]
+        for c_idx, (width, hdr) in enumerate(PART_COLS):
+            col_letter = get_column_letter(c_idx + 1)
+            ws.column_dimensions[col_letter].width = width
+            cell = ws.cell(row=HDR_ROW, column=c_idx + 1, value=hdr)
+            cell.font      = mk_font(size=10, bold=True, color=C_BG)
+            cell.fill      = mk_fill(C_BLUE)
+            cell.alignment = center
+            cell.border    = bdr_full
+        ws.row_dimensions[HDR_ROW].height = 22
+        ws.freeze_panes = ws.cell(row=HDR_ROW + 1, column=1)
+
+        # Part rows
+        parts = db.get_parts(job_id=job["id"])
+        for p_idx, p in enumerate(parts, HDR_ROW + 1):
+            is_arch = any(seg.lower() == "archive"
+                          for seg in Path(p["full_path"]).parts)
+            band      = mk_fill("2A2000") if is_arch else (
+                        mk_fill(C_MANTLE) if p_idx % 2 == 0 else mk_fill(C_BG))
+            txt_color = C_YELLOW if is_arch else C_TEXT
+            fname     = Path(p["full_path"]).name
+            row_vals  = [
+                p["part_number"],
+                f"{p['category_code']} – {p['category_name']}",
+                p["file_ext"].upper(),
+                fname,
+                p["full_path"],
+            ]
+            for c_idx, v in enumerate(row_vals):
+                cell = ws.cell(row=p_idx, column=c_idx + 1, value=v)
+                cell.font      = mk_font(size=9, color=txt_color)
+                cell.fill      = band
+                cell.alignment = left
+                cell.border    = bdr
+            ws.row_dimensions[p_idx].height = 18
+
+        if not parts:
+            ws.merge_cells(f"A{HDR_ROW + 1}:E{HDR_ROW + 1}")
+            empty = ws.cell(row=HDR_ROW + 1, column=1,
+                            value="No parts recorded for this job.")
+            empty.font      = mk_font(size=10, color=C_SUBTEXT, italic=True)
+            empty.fill      = mk_fill(C_BG)
+            empty.alignment = center
+            ws.row_dimensions[HDR_ROW + 1].height = 22
+
+        # Column A width (label column)
+        ws.column_dimensions["A"].width = 16
+
+    try:
+        wb.save(path)
+        QMessageBox.information(
+            parent, "Export Complete",
+            f"Exported {len(jobs)} job(s) + Summary sheet to:\n{path}"
+        )
+        subprocess.Popen(f'explorer /select,"{Path(path)}"', shell=True)
+    except Exception as e:
+        QMessageBox.critical(parent, "Export Failed", str(e))
 
 
 # ── Utility ────────────────────────────────────────────────────────────────
@@ -1945,15 +2724,21 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
 
-        self.tab_my    = MyPartsTab(self.db, self.user_prefix)
-        self.tab_all   = AllPartsTab(self.db, self.user_prefix)
-        self.tab_jobs  = JobsTab(self.db)
-        self.tab_next  = NextNumbersTab(self.db, self.user_prefix, self.cat_prefixes)
+        self.tab_my      = MyPartsTab(self.db, self.user_prefix)
+        self.tab_all     = AllPartsTab(self.db, self.user_prefix)
+        self.tab_jobs    = JobsTab(self.db)
+        self.tab_next    = NextNumbersTab(self.db, self.user_prefix, self.cat_prefixes)
+        self.tab_orphans = OrphansTab(self.db, self.user_prefix, self.cat_prefixes)
+        self.tab_archive = ArchiveTab(self.db, self.user_prefix, self.cat_prefixes)
+        self.tab_history = HistoryTab(self.db)
 
-        self.tabs.addTab(self.tab_my,   f"  My Parts ({self.user_prefix})  ")
-        self.tabs.addTab(self.tab_all,  "  All Parts  ")
-        self.tabs.addTab(self.tab_jobs, "  Jobs  ")
-        self.tabs.addTab(self.tab_next, "  Next Numbers  ")
+        self.tabs.addTab(self.tab_my,      f"  My Parts ({self.user_prefix})  ")
+        self.tabs.addTab(self.tab_all,     "  All Parts  ")
+        self.tabs.addTab(self.tab_jobs,    "  Jobs  ")
+        self.tabs.addTab(self.tab_next,    "  Next Numbers  ")
+        self.tabs.addTab(self.tab_orphans, "  Orphans  ")
+        self.tabs.addTab(self.tab_archive, "  Archive  ")
+        self.tabs.addTab(self.tab_history, "  History  ")
         self.tabs.currentChanged.connect(self._tab_changed)
 
         root_ly.addWidget(self.tabs)
@@ -2027,6 +2812,8 @@ class MainWindow(QMainWindow):
         if self.tabs.widget(index) is self.tab_next:
             self.tab_next.refresh(self.user_prefix, self.cat_prefixes)
             self.tab_next._start_gap_scan()
+        elif self.tabs.widget(index) is self.tab_history:
+            self.tab_history.refresh()
 
     def _reload_tabs(self):
         self.tab_my.refresh(self.user_prefix)
@@ -2034,6 +2821,9 @@ class MainWindow(QMainWindow):
         self.tab_jobs.refresh()
         self.tab_next.refresh(self.user_prefix, self.cat_prefixes)
         self.tab_next._start_gap_scan()
+        self.tab_orphans.refresh(self.user_prefix, self.cat_prefixes)
+        self.tab_archive.refresh(self.user_prefix, self.cat_prefixes)
+        self.tab_history.refresh()
         self.tabs.setTabText(0, f"  My Parts ({self.user_prefix})  ")
 
     def _change_user(self):
