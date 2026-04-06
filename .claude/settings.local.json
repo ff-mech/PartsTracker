@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(taskkill //F //IM python3.exe)",
+      "Bash(taskkill //F //IM pythonw.exe)",
+      "Bash(python -m py_compile \"\\\\\\\\NPSVR05\\\\FOXFAB_REDIRECT$\\\\lbadong\\\\Desktop\\\\File Logger\\\\parts_tracker.py\")"
+    ]
+  }
+}
