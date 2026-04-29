@@ -381,8 +381,18 @@ class Database:
             (lo, hi, lo, hi),
         ).fetchall()
 
+        # SQLite isn't automatically pruned when files are deleted/moved —
+        # `upsert_part` only inserts/updates, never removes. So a "duplicate"
+        # can linger in the DB after the user resolves it by deleting one
+        # copy. Filter at read time: skip rows whose file no longer exists,
+        # then drop groups that fall below 2 entries.
         groups: Dict[Tuple[str, str], dict] = {}
         for r in rows:
+            try:
+                if not Path(r["full_path"]).exists():
+                    continue
+            except OSError:
+                continue   # network share hiccup — treat as missing
             key = (r["part_number"], r["file_ext"])
             g = groups.setdefault(key, {
                 "part_number": r["part_number"],
