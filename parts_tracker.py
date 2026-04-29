@@ -16,7 +16,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -82,7 +82,36 @@ CATEGORIES = {
     "295": "Insulation Barrier",
 }
 
-PART_RE  = re.compile(r"^(\d{3})-(\d{5})\.(sldprt|sldasm)$", re.IGNORECASE)
+PART_RE  = re.compile(r"^(\d{3})-(\d{5})((?:_\d+)*)\.(sldprt|sldasm)$", re.IGNORECASE)
+
+
+def decode_part_filename(name: str) -> Optional["tuple[str, List[str], str]"]:
+    """Decode a SolidWorks part filename into category, all covered part numbers,
+    and lowercase extension. Combined-part files cover multiple sequential numbers
+    via the FoxFab '_NN' suffix convention used in the bom-filler script:
+      '240-90129.SLDPRT'         -> ('240', ['240-90129'], 'sldprt')
+      '240-90129_30.SLDPRT'      -> ('240', ['240-90129', '240-90130'], 'sldprt')
+      '240-90123_124_125.SLDASM' -> ('240', ['240-90123', '240-90124', '240-90125'], 'sldasm')
+    Each '_<suffix>' segment replaces the last len(suffix) chars of the previous
+    part number. Returns None if the name doesn't match the part-file pattern."""
+    m = PART_RE.match(name)
+    if not m:
+        return None
+    cat = m.group(1)
+    base = f"{cat}-{m.group(2)}"
+    suffix_str = m.group(3) or ""
+    ext = m.group(4).lower()
+    if not suffix_str:
+        return cat, [base], ext
+    covered = [base]
+    current = base
+    for s in (seg for seg in suffix_str.split('_') if seg):
+        n = len(s)
+        if len(current) < n:
+            return cat, [base], ext  # malformed — fall back to base only
+        current = current[:-n] + s
+        covered.append(current)
+    return cat, covered, ext
 JOB_RE   = re.compile(r"^(J\d{5})([\s\-].*)?$", re.IGNORECASE)
 SUBJ_RE  = re.compile(r"^(J\d{5}-\d{2})$",      re.IGNORECASE)
 
@@ -258,6 +287,44 @@ class Database:
         except Exception:
             pass  # column already exists
 
+        # Migration: drop UNIQUE on parts.full_path so combined-part files
+        # (e.g. 240-90129_30.sldprt) can occupy multiple part numbers via
+        # one row per covered number with shared full_path.
+        self._migrate_parts_uniqueness()
+
+    def _migrate_parts_uniqueness(self):
+        cur = self.con.cursor()
+        for idx in cur.execute("PRAGMA index_list(parts)").fetchall():
+            if not idx["unique"]:
+                continue
+            cols = [c["name"] for c in cur.execute(f"PRAGMA index_info({idx['name']})").fetchall()]
+            if cols != ["full_path"]:
+                continue
+            cur.executescript("""
+                CREATE TABLE parts_new (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    part_number   TEXT NOT NULL,
+                    category_code TEXT,
+                    category_name TEXT,
+                    user_prefix   TEXT,
+                    file_ext      TEXT,
+                    full_path     TEXT NOT NULL,
+                    job_id        INTEGER REFERENCES jobs(id),
+                    UNIQUE(full_path, part_number)
+                );
+                INSERT INTO parts_new (id, part_number, category_code, category_name,
+                                        user_prefix, file_ext, full_path, job_id)
+                    SELECT id, part_number, category_code, category_name,
+                           user_prefix, file_ext, full_path, job_id FROM parts;
+                DROP TABLE parts;
+                ALTER TABLE parts_new RENAME TO parts;
+                CREATE INDEX IF NOT EXISTS idx_p_user ON parts(user_prefix);
+                CREATE INDEX IF NOT EXISTS idx_p_job  ON parts(job_id);
+                CREATE INDEX IF NOT EXISTS idx_p_cat  ON parts(category_code);
+            """)
+            self.con.commit()
+            return
+
     # settings
     def get(self, key, default=None):
         r = self.con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -291,24 +358,32 @@ class Database:
         self.con.commit()
         return self.job_id(job_number, sub_job)
 
-    def upsert_part(self, part_number, category_code, category_name,
-                    user_prefix, file_ext, full_path, job_id):
-        is_new = not self.con.execute(
-            "SELECT 1 FROM parts WHERE full_path=?", (full_path,)
-        ).fetchone()
-        self.con.execute("""
-            INSERT INTO parts(part_number,category_code,category_name,
-                              user_prefix,file_ext,full_path,job_id)
-            VALUES(?,?,?,?,?,?,?)
-            ON CONFLICT(full_path) DO UPDATE SET job_id=excluded.job_id
-        """, (part_number, category_code, category_name,
-              user_prefix, file_ext, full_path, job_id))
-        if is_new:
-            self.con.execute(
-                "INSERT INTO part_history(event,part_number,full_path,job_id,ts)"
-                " VALUES(?,?,?,?,?)",
-                ("add", part_number, full_path, job_id, datetime.now().isoformat())
-            )
+    def upsert_part(self, part_numbers, category_code, category_name,
+                    file_ext, full_path, job_id):
+        """Insert/update one row per covered part number for a single file.
+        `part_numbers` may be a single 'CAT-NNNNN' string or a list of them
+        (combined-part files cover multiple sequential numbers)."""
+        if isinstance(part_numbers, str):
+            part_numbers = [part_numbers]
+        ts = datetime.now().isoformat()
+        for pn in part_numbers:
+            five = pn.split('-', 1)[1] if '-' in pn else pn
+            is_new = not self.con.execute(
+                "SELECT 1 FROM parts WHERE full_path=? AND part_number=?",
+                (full_path, pn)
+            ).fetchone()
+            self.con.execute("""
+                INSERT INTO parts(part_number,category_code,category_name,
+                                  user_prefix,file_ext,full_path,job_id)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(full_path, part_number) DO UPDATE SET job_id=excluded.job_id
+            """, (pn, category_code, category_name, five, file_ext, full_path, job_id))
+            if is_new:
+                self.con.execute(
+                    "INSERT INTO part_history(event,part_number,full_path,job_id,ts)"
+                    " VALUES(?,?,?,?,?)",
+                    ("add", pn, full_path, job_id, ts)
+                )
         self.con.commit()
 
     def get_jobs(self, search="", size_f="", cat_f=""):
@@ -588,12 +663,18 @@ def find_gaps_via_everything(
                     f'"{cat_code}-{pfx}" ext:{ext} path:"{JOBS_ROOT}"',
                 )
 
-            # Collect numeric part of each matching filename, filtered to user range
+            # Collect numeric part of each matching filename, filtered to user range.
+            # Combined-part files (e.g. 240-90129_30) contribute every covered number.
             present: set = set()
             for hit in hits:
-                m = PART_RE.match(hit["name"])
-                if m and m.group(1) == cat_code:
-                    n = int(m.group(2))
+                decoded = decode_part_filename(hit["name"])
+                if not decoded or decoded[0] != cat_code:
+                    continue
+                for pn in decoded[1]:
+                    try:
+                        n = int(pn.split('-', 1)[1])
+                    except (ValueError, IndexError):
+                        continue
                     if lo <= n <= hi:
                         present.add(n)
 
@@ -613,6 +694,43 @@ def find_gaps_via_everything(
 
     except Exception:
         return {}   # Everything unreachable or error — show no gaps
+
+
+def is_part_number_taken(part_text: str, timeout: float = 3.0) -> Optional[str]:
+    """Click-time check: ask Everything whether `part_text` (e.g. "240-90130")
+    is occupied by any .sldprt/.sldasm file under JOBS_ROOT, INCLUDING combined-part
+    files like "240-90129_30.sldprt" that cover the requested number.
+    Returns the conflicting full path, or None if free / on Everything error.
+    Fail-open on error so a flaky Everything doesn't block the user."""
+    m = re.match(r'^(\d{3})-(\d{5})$', part_text)
+    if not m:
+        return None
+    cat_code = m.group(1)
+    five_digit = m.group(2)
+    # Search the wider "CAT-D" block (D = first digit of the 5-digit) so we catch
+    # combined siblings whose filenames don't contain the literal target string.
+    block_prefix = five_digit[0]
+    try:
+        import requests
+        for ext in ("sldprt", "sldasm"):
+            r = requests.get(EVERYTHING_URL, params={
+                "s": f'"{cat_code}-{block_prefix}" ext:{ext} path:"{JOBS_ROOT}"',
+                "j": 1, "path_column": 1, "count": 200000,
+            }, timeout=timeout)
+            r.raise_for_status()
+            for item in r.json().get("results", []):
+                name = item.get("name") or item.get("filename", "")
+                path = item.get("path", "")
+                if not (name and path):
+                    continue
+                decoded = decode_part_filename(name)
+                if not decoded or decoded[0] != cat_code:
+                    continue
+                if part_text in decoded[1]:
+                    return str(Path(path) / name)
+        return None
+    except Exception:
+        return None
 
 
 # ── PRF Reader ─────────────────────────────────────────────────────────────
@@ -785,19 +903,16 @@ class ScanWorker(QThread):
                     continue
 
                 for f in files:
-                    m = PART_RE.match(f.name)
-                    if not m:
+                    decoded = decode_part_filename(f.name)
+                    if not decoded:
                         continue
-                    cat_code = m.group(1)
-                    five_dig = m.group(2)   # 5-digit ID, e.g. "90015"
-                    file_ext = m.group(3).lower()
-                    part_num = f"{cat_code}-{five_dig}"
+                    cat_code, part_nums, file_ext = decoded
                     cat_name = CATEGORIES.get(cat_code, "Unknown")
                     self.db.upsert_part(
-                        part_num, cat_code, cat_name,
-                        five_dig, file_ext, str(f), job_id
+                        part_nums, cat_code, cat_name,
+                        file_ext, str(f), job_id
                     )
-                    new_parts += 1
+                    new_parts += len(part_nums)
 
             self.progress.emit(100, "Complete")
             self.folders_found.emit([str(f) for f in folders])
@@ -842,14 +957,14 @@ class DirectoryRescanWorker(QThread):
 
             # Upsert every file currently on disk
             for path_str, f in disk_files.items():
-                m = PART_RE.match(f.name)
-                cat_code = m.group(1)
-                five_dig = m.group(2)
-                file_ext = m.group(3).lower()
+                decoded = decode_part_filename(f.name)
+                if not decoded:
+                    continue
+                cat_code, part_nums, file_ext = decoded
                 self.db.upsert_part(
-                    f"{cat_code}-{five_dig}", cat_code,
+                    part_nums, cat_code,
                     CATEGORIES.get(cat_code, "Unknown"),
-                    five_dig, file_ext, path_str, job_id
+                    file_ext, path_str, job_id
                 )
 
             # Delete DB records for files that no longer exist on disk
@@ -1563,6 +1678,7 @@ class NextNumbersTab(QWidget):
         self._cards: Dict[str, dict] = {}
         self._cached_gaps = None
         self._gap_worker: Optional[GapScanWorker] = None
+        self._session_taken: Set[str] = set()
         self._build()
 
         self._poll_timer = QTimer(self)
@@ -1717,6 +1833,7 @@ class NextNumbersTab(QWidget):
         self._cached_gaps = result
         self._gap_worker = None
         self._gap_scan_btn.setEnabled(True)
+        self._session_taken.clear()
         self.refresh()
 
     def _scan_gaps_now(self):
@@ -1799,9 +1916,35 @@ class NextNumbersTab(QWidget):
     def _copy_next(self, text: str, code: str):
         if not text or text == "—":
             return
+
+        # Click-time validation: ask Everything if this number is already on disk.
+        # Catches stale-cache bugs where the gap list (or latest+1) collides with
+        # files added since the last scan, by another engineer or in another session.
+        conflict_path = is_part_number_taken(text)
+        if conflict_path:
+            QMessageBox.warning(
+                self,
+                "Number Already In Use",
+                f"{text} is already on disk:\n\n{conflict_path}\n\n"
+                "The suggestion was stale. Refreshing the gap cache now — "
+                "click Copy again for a fresh number."
+            )
+            self._session_taken.add(text)
+            if self._cached_gaps and code in self._cached_gaps:
+                try:
+                    self._cached_gaps[code].remove(text)
+                except ValueError:
+                    pass
+                if not self._cached_gaps[code]:
+                    del self._cached_gaps[code]
+            self.refresh()
+            self._start_gap_scan()
+            return
+
         # Copy only the 5-digit numeric part (e.g. "90015" from "200-90015")
         num_only = text.split("-", 1)[1] if "-" in text else text
         QApplication.clipboard().setText(num_only)
+        self._session_taken.add(text)
         # Remove used gap from cache so next gap (or latest+1) shows next
         if self._cached_gaps and code in self._cached_gaps:
             try:
@@ -1829,11 +1972,17 @@ class NextNumbersTab(QWidget):
             eff_pfx  = self.cat_prefixes.get(code, self.user_prefix)
             gap_list = gaps.get(code, [])
 
-            if gap_list:
-                nxt      = gap_list[0]  # lowest missing number first
+            available_gaps = [g for g in gap_list if g not in self._session_taken]
+            if available_gaps:
+                nxt      = available_gaps[0]  # lowest missing number first
                 is_gap   = True
             else:
                 nxt      = _next_part(eff_pfx, code, latest)
+                safety   = 0
+                while nxt in self._session_taken and safety < 10_000:
+                    five = nxt.split("-")[1]
+                    nxt  = f"{code}-{str(int(five) + 1).zfill(5)}"
+                    safety += 1
                 is_gap   = False
 
             self._cards[code]["latest_lbl"].setText(latest if latest else "None yet")
