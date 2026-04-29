@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import sqlite3
 import threading
 import queue
@@ -453,16 +454,24 @@ def find_003_folders(user_prefix: str) -> List[Path]:
 
 
 def find_gaps_via_everything(user_prefix: str,
-                              cat_prefixes: Dict[str, str] = None) -> Dict[str, List[str]]:
-    """Compute real gaps by asking Everything for every matching file on disk."""
+                              cat_prefixes: Dict[str, str] = None) -> Dict[str, Dict]:
+    """Compute real gaps AND the actual highest-assigned number per category
+    by asking Everything for every matching file on disk.
+    Returns {"gaps": {cat: [missing, ...], ...}, "latests": {cat: 'CAT-NNNNN', ...}}.
+    Because Everything sees ALL folders (including Archive/Backup/old), the
+    latests reflect every assigned number — unlike SQLite `latest_by_category()`
+    which only sees the immediate `201 CAD/` folder and misses archived numbers.
+    Returns {"gaps": {}, "latests": {}} on error."""
+    empty = {"gaps": {}, "latests": {}}
     if not user_prefix:
-        return {}
+        return empty
     if cat_prefixes is None:
         cat_prefixes = {}
     try:
         import requests
         session = requests.Session()
-        result: Dict[str, List[str]] = {}
+        gaps_result: Dict[str, List[str]] = {}
+        latests_result: Dict[str, str] = {}
         for cat_code in CATEGORIES:
             if cat_code == "003":
                 continue
@@ -489,19 +498,24 @@ def find_gaps_via_everything(user_prefix: str,
                     if lo <= n <= hi:
                         present.add(n)
 
-            if len(present) < 2:
+            if not present:
                 continue
-            min_n, max_n = min(present), max(present)
-            gaps = [
-                f"{cat_code}-{str(n).zfill(5)}"
-                for n in range(min_n + 1, max_n)
-                if n not in present
-            ]
-            if gaps:
-                result[cat_code] = gaps
-        return result
+
+            max_n = max(present)
+            latests_result[cat_code] = f"{cat_code}-{str(max_n).zfill(5)}"
+
+            if len(present) >= 2:
+                min_n = min(present)
+                gaps = [
+                    f"{cat_code}-{str(n).zfill(5)}"
+                    for n in range(min_n + 1, max_n)
+                    if n not in present
+                ]
+                if gaps:
+                    gaps_result[cat_code] = gaps
+        return {"gaps": gaps_result, "latests": latests_result}
     except Exception:
-        return {}
+        return empty
 
 
 def is_part_number_taken(part_text: str, timeout: float = 3.0) -> Optional[str]:
@@ -1262,6 +1276,8 @@ class NextNumbersTab(tk.Frame):
         self._cards: Dict[str, dict] = {}
         self._gap_rows: Dict[str, dict] = {}
         self._cached_gaps: Optional[Dict[str, List[str]]] = None
+        self._cached_latests: Dict[str, str] = {}
+        self._last_gap_scan_at: Optional[float] = None
         self._reserved_numbers: Dict[str, set] = {}
         self._gap_worker: Optional[GapScanWorker] = None
         self._gap_queue: queue.Queue = queue.Queue()
@@ -1550,13 +1566,6 @@ class NextNumbersTab(tk.Frame):
         # files added since the last scan, by another engineer or in another session.
         conflict_path = is_part_number_taken(text)
         if conflict_path:
-            messagebox.showwarning(
-                "Number Already In Use",
-                f"{text} is already on disk:\n\n{conflict_path}\n\n"
-                "The suggestion was stale. Refreshing the gap cache now — "
-                "click Copy again for a fresh number.",
-                parent=self,
-            )
             self._reserved_numbers.setdefault(code, set()).add(text)
             if self._cached_gaps and code in self._cached_gaps:
                 try:
@@ -1565,7 +1574,16 @@ class NextNumbersTab(tk.Frame):
                     pass
                 if not self._cached_gaps[code]:
                     del self._cached_gaps[code]
+            # Refresh first so the card already shows the next available number
+            # by the time the user dismisses the dialog.
             self.refresh()
+            new_next = card["next_lbl"].cget("text")
+            messagebox.showwarning(
+                "Number Already In Use",
+                f"{text} is already on disk:\n\n{conflict_path}\n\n"
+                f"Suggestion auto-updated to {new_next}. Click Copy again to take it.",
+                parent=self,
+            )
             self._start_gap_scan()
             return
 
@@ -1623,8 +1641,11 @@ class NextNumbersTab(tk.Frame):
                                           self._gap_queue)
         self._gap_worker.start()
 
-    def _on_gap_scan_done(self, result: Dict[str, List[str]]):
-        self._cached_gaps = result
+    def _on_gap_scan_done(self, result: dict):
+        # `result` is {"gaps": {...}, "latests": {...}} — see find_gaps_via_everything()
+        self._cached_gaps    = result.get("gaps", {})
+        self._cached_latests = result.get("latests", {})
+        self._last_gap_scan_at = time.monotonic()
         self._gap_worker = None
         try:
             self._gap_scan_btn.configure(state="normal")
@@ -1704,13 +1725,31 @@ class NextNumbersTab(tk.Frame):
         if cat_prefixes is not None:
             self.cat_prefixes = cat_prefixes
 
+        # Auto-trigger a fresh Everything scan if the tab is visible and the
+        # gap cache is stale (>60s) or never populated. Without this, Latest
+        # comes from SQLite which doesn't see Archive/Backup folders, so the
+        # displayed Next can collide with archived numbers and the click-time
+        # conflict popup fires.
+        if self.user_prefix and bool(self.winfo_viewable()):
+            scan_age = (
+                None if self._last_gap_scan_at is None
+                else (time.monotonic() - self._last_gap_scan_at)
+            )
+            scan_stale = scan_age is None or scan_age > 60
+            scan_running = bool(self._gap_worker and self._gap_worker.is_alive())
+            if scan_stale and not scan_running:
+                self._start_gap_scan()
+
         rows = self.db.latest_by_category(self.user_prefix, self.cat_prefixes)
         existing = {r["category_code"]: r for r in rows}
         gaps = self._cached_gaps if self._cached_gaps is not None else {}
 
         for code, card in self._cards.items():
             row      = existing.get(code)
-            latest   = row["latest_part"] if row else ""
+            # Prefer the Everything-derived latest (sees Archive folders) over
+            # SQLite's `latest_by_category` (immediate `201 CAD/` only).
+            ev_latest = self._cached_latests.get(code) if self._cached_latests else None
+            latest   = ev_latest or (row["latest_part"] if row else "")
             eff_pfx  = self.cat_prefixes.get(code, self.user_prefix)
             gap_list = gaps.get(code, [])
             reserved = self._reserved_numbers.get(code, set())
