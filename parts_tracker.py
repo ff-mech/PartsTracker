@@ -70,6 +70,10 @@ def make_icon() -> QIcon:
 
 # ── Constants ──────────────────────────────────────────────────────────────
 JOBS_ROOT = r"Z:\FOXFAB_DATA\ENGINEERING\2 JOBS"
+# Broader scope used by gap finder + collision check so numbers assigned in
+# DESIGNERS\..., For Vikram\Demo Unit\CAD, MODEL LIBRARY, 0 PRODUCTS, etc.
+# count as "taken" — JOBS_ROOT alone misses them.
+ENG_ROOT  = r"Z:\FOXFAB_DATA\ENGINEERING"
 EVERYTHING_URL = "http://localhost:8080/"
 DB_PATH = Path(os.environ["APPDATA"]) / "PartsTracker" / "parts.db"
 
@@ -634,13 +638,15 @@ def find_gaps_via_everything(
     user_prefix: str,
     cat_prefixes: Dict[str, str] = None,
 ) -> Dict[str, Dict]:
-    """Compute genuine gaps AND the actual highest-assigned number per category
-    by asking Everything for every file on disk.
+    """Compute genuine gaps + Latest per category by asking Everything for every
+    matching file under ENG_ROOT, then bucketing each hit twice:
+      • primary_present — file is under JOBS_ROOT (drives Latest/Next; anchored
+        to the user's primary working area so a stray number elsewhere doesn't
+        yank Latest).
+      • broader_present — file is anywhere under ENG_ROOT (used to verify gaps;
+        a number that exists in DESIGNERS\\..., MODEL LIBRARY, 0 PRODUCTS, For
+        Vikram\\Demo Unit\\CAD, etc. is NOT a gap).
     Returns {"gaps": {cat: [missing, ...], ...}, "latests": {cat: 'CAT-NNNNN', ...}}.
-    Because Everything sees ALL folders (including Archive/Backup/old), the
-    latests from this function reflect every assigned number — unlike the SQLite
-    `latest_by_category()` which only sees the immediate `201 CAD/` folder and
-    misses anything that's been archived.
     Returns {"gaps": {}, "latests": {}} on error (Everything unreachable, etc.).
     """
     empty = {"gaps": {}, "latests": {}}
@@ -648,6 +654,7 @@ def find_gaps_via_everything(
         return empty
     if cat_prefixes is None:
         cat_prefixes = {}
+    jobs_prefix_lc = JOBS_ROOT.lower()
     try:
         import requests
         session = requests.Session()
@@ -660,41 +667,51 @@ def find_gaps_via_everything(
             pfx = cat_prefixes.get(cat_code, user_prefix)
             lo, hi = Database._prefix_range(pfx)
 
-            # Fetch every matching file from Everything for this category+prefix
+            # Wider Everything scope — covers JOBS, DESIGNERS, MODEL LIBRARY,
+            # 0 PRODUCTS, etc. so cross-folder copies count as taken.
             hits: List[Dict] = []
             for ext in ("sldprt", "sldasm"):
                 hits += _eq(
                     session,
-                    f'"{cat_code}-{pfx}" ext:{ext} path:"{JOBS_ROOT}"',
+                    f'"{cat_code}-{pfx}" ext:{ext} path:"{ENG_ROOT}"',
                 )
 
-            # Collect numeric part of each matching filename, filtered to user range.
-            # Combined-part files (e.g. 240-90129_30) contribute every covered number.
-            present: set = set()
+            primary_present: set = set()
+            broader_present: set = set()
             for hit in hits:
                 decoded = decode_part_filename(hit["name"])
                 if not decoded or decoded[0] != cat_code:
                     continue
+                in_jobs = hit["path"].lower().startswith(jobs_prefix_lc)
                 for pn in decoded[1]:
                     try:
                         n = int(pn.split('-', 1)[1])
                     except (ValueError, IndexError):
                         continue
-                    if lo <= n <= hi:
-                        present.add(n)
+                    if not (lo <= n <= hi):
+                        continue
+                    broader_present.add(n)
+                    if in_jobs:
+                        primary_present.add(n)
 
-            if not present:
+            # Anchor Latest + gap-range bounds to JOBS_ROOT activity if any;
+            # fall back to the broader scope for brand-new prefixes that have
+            # nothing in JOBS_ROOT yet.
+            anchor_present = primary_present or broader_present
+            if not anchor_present:
                 continue
 
-            max_n = max(present)
+            max_n = max(anchor_present)
             latests_result[cat_code] = f"{cat_code}-{str(max_n).zfill(5)}"
 
-            if len(present) >= 2:
-                min_n = min(present)
+            # Gap verification: candidate is a real gap only if NO file matches
+            # it anywhere under ENG_ROOT (broader_present is the source of truth).
+            if len(anchor_present) >= 2:
+                min_n = min(anchor_present)
                 gaps = [
                     f"{cat_code}-{str(n).zfill(5)}"
                     for n in range(min_n + 1, max_n)
-                    if n not in present
+                    if n not in broader_present
                 ]
                 if gaps:
                     gaps_result[cat_code] = gaps
@@ -707,8 +724,10 @@ def find_gaps_via_everything(
 
 def is_part_number_taken(part_text: str, timeout: float = 3.0) -> Optional[str]:
     """Click-time check: ask Everything whether `part_text` (e.g. "240-90130")
-    is occupied by any .sldprt/.sldasm file under JOBS_ROOT, INCLUDING combined-part
-    files like "240-90129_30.sldprt" that cover the requested number.
+    is occupied by any .sldprt/.sldasm file under ENG_ROOT, INCLUDING combined-part
+    files like "240-90129_30.sldprt" that cover the requested number. Searches
+    the broader ENG scope (not just JOBS_ROOT) so a Copy click can't clobber a
+    file in DESIGNERS\\..., For Vikram\\Demo Unit\\CAD, MODEL LIBRARY, etc.
     Returns the conflicting full path, or None if free / on Everything error.
     Fail-open on error so a flaky Everything doesn't block the user."""
     m = re.match(r'^(\d{3})-(\d{5})$', part_text)
@@ -723,7 +742,7 @@ def is_part_number_taken(part_text: str, timeout: float = 3.0) -> Optional[str]:
         import requests
         for ext in ("sldprt", "sldasm"):
             r = requests.get(EVERYTHING_URL, params={
-                "s": f'"{cat_code}-{block_prefix}" ext:{ext} path:"{JOBS_ROOT}"',
+                "s": f'"{cat_code}-{block_prefix}" ext:{ext} path:"{ENG_ROOT}"',
                 "j": 1, "path_column": 1, "count": 200000,
             }, timeout=timeout)
             r.raise_for_status()
