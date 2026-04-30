@@ -15,9 +15,10 @@ import sys
 import time
 import sqlite3
 import subprocess
+import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Tuple
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLabel, QComboBox, QProgressBar, QDialog, QFormLayout, QMessageBox,
     QSplitter, QListWidget, QListWidgetItem, QHeaderView, QGroupBox,
     QStatusBar, QAbstractItemView, QFrame, QGridLayout,
+    QTreeWidget, QTreeWidgetItem,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QPen, QPolygonF
@@ -578,6 +580,67 @@ class Database:
 
         con.close()
         return result
+
+    def get_duplicate_parts(self, user_prefix: str) -> List[dict]:
+        """Find part numbers that appear at >1 distinct full_path under the user's
+        prefix range (excluding any path with an 'archive' segment). Filters at
+        read time against `Path.exists()` so resolved duplicates (deleted/moved
+        copies) drop out — the SQLite `parts` table is append-only via
+        `upsert_part`, so it lingers stale entries until rescan.
+        Returns [{'part_number', 'file_ext', 'entries':[{full_path, job_number,
+        sub_job, job_name}, ...]}, ...]."""
+        if not user_prefix:
+            return []
+        try:
+            lo, hi = self._prefix_range(user_prefix)
+        except ValueError:
+            return []
+        NO_ARCHIVE = "AND LOWER(full_path) NOT LIKE '%\\archive\\%'"
+        rows = self.con.execute(
+            f"""
+            SELECT p.part_number, p.file_ext, p.full_path,
+                   j.job_number, j.sub_job, j.job_name
+            FROM parts p
+            LEFT JOIN jobs j ON p.job_id = j.id
+            INNER JOIN (
+                SELECT part_number, file_ext
+                FROM parts
+                WHERE CAST(user_prefix AS INTEGER) BETWEEN ? AND ?
+                  {NO_ARCHIVE}
+                GROUP BY part_number, file_ext
+                HAVING COUNT(DISTINCT full_path) > 1
+            ) dup
+              ON dup.part_number = p.part_number
+             AND dup.file_ext    = p.file_ext
+            WHERE CAST(p.user_prefix AS INTEGER) BETWEEN ? AND ?
+              {NO_ARCHIVE.replace('full_path', 'p.full_path')}
+            ORDER BY p.part_number, p.file_ext, p.full_path
+            """,
+            (lo, hi, lo, hi),
+        ).fetchall()
+
+        groups: Dict[Tuple[str, str], dict] = {}
+        for r in rows:
+            try:
+                if not Path(r["full_path"]).exists():
+                    continue
+            except OSError:
+                continue   # network share hiccup — treat as missing
+            key = (r["part_number"], r["file_ext"])
+            g = groups.setdefault(key, {
+                "part_number": r["part_number"],
+                "file_ext":    r["file_ext"],
+                "entries":     [],
+            })
+            if any(e["full_path"] == r["full_path"] for e in g["entries"]):
+                continue
+            g["entries"].append({
+                "full_path":  r["full_path"],
+                "job_number": r["job_number"],
+                "sub_job":    r["sub_job"],
+                "job_name":   r["job_name"],
+            })
+        return [g for g in groups.values() if len(g["entries"]) > 1]
 
     def clear_all(self):
         self.con.executescript("DELETE FROM parts; DELETE FROM jobs;")
@@ -1762,6 +1825,10 @@ class NextNumbersTab(QWidget):
 
         self._gap_panel = self._build_gap_section()
         outer.addWidget(self._gap_panel)
+
+        self._dup_panel = self._build_dup_section()
+        outer.addWidget(self._dup_panel)
+
         outer.addStretch()
 
     def _build_gap_section(self) -> QFrame:
@@ -1861,16 +1928,142 @@ class NextNumbersTab(QWidget):
 
     def _on_gap_scan_done(self, result: dict):
         # `result` is {"gaps": {...}, "latests": {...}} — see find_gaps_via_everything()
-        self._cached_gaps    = result.get("gaps", {})
-        self._cached_latests = result.get("latests", {})
-        self._last_gap_scan_at = time.monotonic()
-        self._gap_worker = None
-        self._gap_scan_btn.setEnabled(True)
-        self._session_taken.clear()
-        self.refresh()
+        try:
+            self._cached_gaps    = result.get("gaps", {})
+            self._cached_latests = result.get("latests", {})
+            self._last_gap_scan_at = time.monotonic()
+            self._gap_worker = None
+            self._gap_scan_btn.setEnabled(True)
+            self._session_taken.clear()
+            self.refresh()
+        except Exception:
+            # Don't let a slot exception crash Qt — log + drop the result.
+            traceback.print_exc()
+            try:
+                self._gap_status_lbl.setText("Refresh error — see crash.log")
+                self._gap_status_lbl.setStyleSheet("font-size:11px; color:#f38ba8;")
+                self._gap_scan_btn.setEnabled(True)
+            except Exception:
+                pass
 
     def _scan_gaps_now(self):
         self._start_gap_scan()
+
+    # ── Duplicate Parts section (mirrors the Tk hub layout) ──
+    def _build_dup_section(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("dup_panel")
+        panel.setStyleSheet(
+            "QFrame#dup_panel { background:#181825; border:1px solid #313244; border-radius:8px; }"
+        )
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(16, 14, 16, 14)
+        pl.setSpacing(0)
+
+        hdr = QHBoxLayout()
+        hdr.setSpacing(10)
+        title = QLabel("Duplicate Parts")
+        title.setStyleSheet("font-size:14px; font-weight:bold; color:#f38ba8;")
+        hdr.addWidget(title)
+        self._dup_status_lbl = QLabel("Pending — click Scan to run")
+        self._dup_status_lbl.setStyleSheet("font-size:11px; color:#585b70;")
+        hdr.addWidget(self._dup_status_lbl)
+        hdr.addStretch()
+        self._dup_scan_btn = QPushButton("Scan Duplicates")
+        self._dup_scan_btn.setStyleSheet(
+            "QPushButton { background:#f38ba8; color:#1e1e2e; border:none; border-radius:5px;"
+            " font-size:11px; font-weight:bold; padding:4px 12px; }"
+            "QPushButton:hover { background:#fab8c4; }"
+            "QPushButton:disabled { background:#45475a; color:#585b70; }"
+        )
+        self._dup_scan_btn.clicked.connect(self._scan_duplicates_now)
+        hdr.addWidget(self._dup_scan_btn)
+        pl.addLayout(hdr)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background:#313244; max-height:1px; margin-top:10px; margin-bottom:6px;")
+        pl.addWidget(sep)
+
+        self._dup_tree = QTreeWidget()
+        self._dup_tree.setHeaderLabels(["Part / Path", "Job"])
+        self._dup_tree.setColumnWidth(0, 560)
+        self._dup_tree.setRootIsDecorated(True)
+        self._dup_tree.setMaximumHeight(220)
+        self._dup_tree.setVisible(False)
+        self._dup_tree.itemDoubleClicked.connect(self._on_dup_double_click)
+        pl.addWidget(self._dup_tree)
+
+        self._dup_empty_lbl = QLabel("")
+        self._dup_empty_lbl.setStyleSheet("color:#585b70; font-size:11px; padding:6px 0;")
+        self._dup_empty_lbl.setVisible(False)
+        pl.addWidget(self._dup_empty_lbl)
+
+        return panel
+
+    def _scan_duplicates_now(self):
+        if not self.user_prefix:
+            self._dup_status_lbl.setText("No user configured")
+            return
+        self._dup_scan_btn.setEnabled(False)
+        self._dup_status_lbl.setText("Scanning…")
+        self._dup_status_lbl.setStyleSheet("font-size:11px; color:#89b4fa;")
+        try:
+            groups = self.db.get_duplicate_parts(self.user_prefix)
+        except Exception as e:
+            self._dup_status_lbl.setText(f"Error: {e}")
+            self._dup_status_lbl.setStyleSheet("font-size:11px; color:#f38ba8;")
+            self._dup_scan_btn.setEnabled(True)
+            return
+
+        self._dup_tree.clear()
+        if not groups:
+            self._dup_tree.setVisible(False)
+            self._dup_empty_lbl.setText(
+                "No duplicate parts found. Your part numbers are all unique."
+            )
+            self._dup_empty_lbl.setVisible(True)
+            self._dup_status_lbl.setText("0 duplicates")
+            self._dup_status_lbl.setStyleSheet("font-size:11px; color:#a6e3a1;")
+        else:
+            self._dup_empty_lbl.setVisible(False)
+            self._dup_tree.setVisible(True)
+            DUP_FG  = QColor("#f38ba8")
+            FILE_FG = QColor("#a6adc8")
+            total_files = 0
+            for g in groups:
+                pn   = g["part_number"]
+                ext  = g["file_ext"]
+                kids = g["entries"]
+                total_files += len(kids)
+                top = QTreeWidgetItem(
+                    [f"{pn}.{ext.lstrip('.').lower()}  ({len(kids)} copies)", ""]
+                )
+                top.setForeground(0, DUP_FG)
+                for entry in kids:
+                    job_label = ""
+                    if entry.get("job_number"):
+                        job_label = entry["job_number"]
+                        if entry.get("sub_job") and entry["sub_job"] != entry["job_number"]:
+                            job_label += f" / {entry['sub_job']}"
+                    child = QTreeWidgetItem([entry["full_path"], job_label])
+                    child.setForeground(0, FILE_FG)
+                    child.setData(0, Qt.ItemDataRole.UserRole, entry["full_path"])
+                    top.addChild(child)
+                top.setExpanded(True)
+                self._dup_tree.addTopLevelItem(top)
+
+            n = len(groups)
+            self._dup_status_lbl.setText(
+                f"{n} duplicated part number{'s' if n != 1 else ''} ({total_files} files total)"
+            )
+            self._dup_status_lbl.setStyleSheet("font-size:11px; color:#f9e2af;")
+        self._dup_scan_btn.setEnabled(True)
+
+    def _on_dup_double_click(self, item: QTreeWidgetItem, _col: int):
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path:
+            open_path(path)
 
     def _make_card(self, code: str, name: str, color: str) -> QFrame:
         card = QFrame()
@@ -1949,13 +2142,38 @@ class NextNumbersTab(QWidget):
     def _copy_next(self, text: str, code: str):
         if not text or text == "—":
             return
+        try:
+            # Click-time validation: ask Everything if this number is already on disk.
+            # Catches stale-cache bugs where the gap list (or latest+1) collides with
+            # files added since the last scan, by another engineer or in another session.
+            conflict_path = is_part_number_taken(text)
+            if conflict_path:
+                self._session_taken.add(text)
+                if self._cached_gaps and code in self._cached_gaps:
+                    try:
+                        self._cached_gaps[code].remove(text)
+                    except ValueError:
+                        pass
+                    if not self._cached_gaps[code]:
+                        del self._cached_gaps[code]
+                # Refresh first so the card already shows the next available number
+                # by the time the user dismisses the dialog.
+                self.refresh()
+                new_next = self._cards[code]["next_lbl"].text()
+                QMessageBox.warning(
+                    self,
+                    "Number Already In Use",
+                    f"{text} is already on disk:\n\n{conflict_path}\n\n"
+                    f"Suggestion auto-updated to {new_next}. Click Copy again to take it."
+                )
+                self._start_gap_scan()
+                return
 
-        # Click-time validation: ask Everything if this number is already on disk.
-        # Catches stale-cache bugs where the gap list (or latest+1) collides with
-        # files added since the last scan, by another engineer or in another session.
-        conflict_path = is_part_number_taken(text)
-        if conflict_path:
+            # Copy only the 5-digit numeric part (e.g. "90015" from "200-90015")
+            num_only = text.split("-", 1)[1] if "-" in text else text
+            QApplication.clipboard().setText(num_only)
             self._session_taken.add(text)
+            # Remove used gap from cache so next gap (or latest+1) shows next
             if self._cached_gaps and code in self._cached_gaps:
                 try:
                     self._cached_gaps[code].remove(text)
@@ -1963,32 +2181,9 @@ class NextNumbersTab(QWidget):
                     pass
                 if not self._cached_gaps[code]:
                     del self._cached_gaps[code]
-            # Refresh first so the card already shows the next available number
-            # by the time the user dismisses the dialog.
             self.refresh()
-            new_next = self._cards[code]["next_lbl"].text()
-            QMessageBox.warning(
-                self,
-                "Number Already In Use",
-                f"{text} is already on disk:\n\n{conflict_path}\n\n"
-                f"Suggestion auto-updated to {new_next}. Click Copy again to take it."
-            )
-            self._start_gap_scan()
-            return
-
-        # Copy only the 5-digit numeric part (e.g. "90015" from "200-90015")
-        num_only = text.split("-", 1)[1] if "-" in text else text
-        QApplication.clipboard().setText(num_only)
-        self._session_taken.add(text)
-        # Remove used gap from cache so next gap (or latest+1) shows next
-        if self._cached_gaps and code in self._cached_gaps:
-            try:
-                self._cached_gaps[code].remove(text)
-            except ValueError:
-                pass
-            if not self._cached_gaps[code]:
-                del self._cached_gaps[code]
-        self.refresh()
+        except Exception:
+            traceback.print_exc()
 
     def refresh(self, user_prefix: str = None, cat_prefixes: Dict[str, str] = None):
         if user_prefix:
@@ -3011,11 +3206,14 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Scan Error", msg)
 
     def _tab_changed(self, index: int):
-        if self.tabs.widget(index) is self.tab_next:
-            self.tab_next.refresh(self.user_prefix, self.cat_prefixes)
-            self.tab_next._start_gap_scan()
-        elif self.tabs.widget(index) is self.tab_history:
-            self.tab_history.refresh()
+        try:
+            if self.tabs.widget(index) is self.tab_next:
+                self.tab_next.refresh(self.user_prefix, self.cat_prefixes)
+                self.tab_next._start_gap_scan()
+            elif self.tabs.widget(index) is self.tab_history:
+                self.tab_history.refresh()
+        except Exception:
+            traceback.print_exc()
 
     def _reload_tabs(self):
         self.tab_my.refresh(self.user_prefix)
@@ -3055,7 +3253,27 @@ class MainWindow(QMainWindow):
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────
+def _install_excepthook():
+    """Log unhandled exceptions to %APPDATA%\\PartsTracker\\crash.log instead of
+    letting PyQt6 abort the app. PyQt 6.1+ aborts on uncaught slot exceptions
+    by default — this keeps the window alive long enough to keep working."""
+    log_path = DB_PATH.parent / "crash.log"
+
+    def _hook(typ, value, tb):
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n--- {datetime.now().isoformat()} ---\n")
+                traceback.print_exception(typ, value, tb, file=f)
+        except Exception:
+            pass
+        traceback.print_exception(typ, value, tb, file=sys.stderr)
+
+    sys.excepthook = _hook
+
+
 def main():
+    _install_excepthook()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
