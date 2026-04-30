@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-04-30
+
+### Fixed
+
+- **Orphans / Archive tab robustness** — three filters added to drop noise that was previously polluting the Orphans tab. Empirical impact on the 9-prefix dataset: 65 → 15 surviving entries (77% reduction; the 50 dropped were SolidWorks lock files and vendor-library hardware whose filenames embedded a FoxFab-shaped substring).
+  1. **Filename pattern** — only files whose names start with `<CAT>-<NNNNN>` are considered. Filters out `~$*.sldprt` / `~$*.sldasm` SolidWorks lock files and vendor parts like `SS Cam Adaptor_200-9598.00-00000.SLDPRT` where the FoxFab-shaped string is just an embedded substring.
+  2. **Folder scope** — files must live inside a `\201 CAD\` path segment (case-insensitive). Skips vendor subfolders (`\Dirak\`, hardware-library directories, etc.) inside a job tree.
+  3. **Folder exclusions** — paths containing `\Backup\` or `\old\` segments are skipped. `\Archive\` continues to be excluded for the Orphans tab and required for the Archive tab.
+
+### Added
+
+- New `ORPHAN_PART_RE` regex (permissive: `^\d{3}-\d{5}.*\.(sldprt|sldasm)$`) used by the Orphan / Archive scanner. Unlike the strict `PART_RE`, it accepts rev-suffix files (`200-90123-rA.sldprt`) and numbered-copy files (`200-90123 (1).sldprt`), which are real parts but were previously rejected.
+- Orphan / Archive list entries now display the full filename stem (`200-90123-rA`) rather than just `<CAT>-<NNNNN>`, preserving rev and combined-part info on screen.
+
 ## [1.5.0] - 2026-04-30
 
 ### Added
@@ -60,7 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release of Parts Tracker.
 - Core file logging and parts tracking functionality.
 
-[Unreleased]: https://github.com/ff-mech/PartsTracker/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/ff-mech/PartsTracker/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/ff-mech/PartsTracker/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/ff-mech/PartsTracker/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/ff-mech/PartsTracker/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/ff-mech/PartsTracker/compare/v1.2.0...v1.3.0

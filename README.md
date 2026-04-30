@@ -186,15 +186,23 @@ A live filesystem watcher monitors the job root and refreshes the cards automati
 
 ### Orphans
 
-Lists part files on disk that match the active user's prefix but are **not** recorded in any scanned job folder and are **not** inside an `archive` folder. Files are discovered via the Everything HTTP API.
+Lists FoxFab-pattern part files in `\201 CAD\` folders under `2 JOBS\` that exist on disk but aren't tracked in the local SQLite DB. Typically a part that was created or renamed since the last scan, or a file in an un-scanned job folder. Files are discovered via the Everything HTTP API.
 
-Orphaned parts typically indicate files that were created outside the standard job workflow or whose job folder has not yet been scanned. Reviewing this tab regularly helps keep the database accurate.
+Three filters are applied to keep the list signal-rich:
+
+1. **Filename must start with `<CAT>-<NNNNN>`** — drops SolidWorks lock files (`~$*.sldprt`) and vendor / hardware-library parts (`SS Cam Adaptor_200-9598.00-00000.SLDPRT`) where the FoxFab-shaped string is just an embedded substring.
+2. **Path must contain a `\201 CAD\` segment** — drops vendor subfolders (`\Dirak\`, `\OEM\`, etc.) nested inside a job tree.
+3. **`\Archive\`, `\Backup\`, and `\old\` segments excluded** — these directories aren't part of the active scan set.
+
+Rev-suffix files (`200-90123-rA.sldprt`) and numbered-copy files (`200-90123 (1).sldprt`) are recognised and included — they're real parts even though they don't fit the strict `<CAT>-<NNNNN>.sldprt` form. The list shows the full filename stem so the rev / combined-part suffix is visible.
+
+Reviewing this tab regularly helps keep the database accurate.
 
 ---
 
 ### Archive
 
-Lists part files on disk that match the active user's prefix and **are** located inside a folder named `archive` (case-insensitive, anywhere in the path). Files are discovered via the Everything HTTP API.
+Lists FoxFab-pattern part files in `\201 CAD\Archive\` folders under `2 JOBS\` that aren't tracked in any active scanned job folder. Same filename + folder scope filters as the Orphans tab, but with `\Archive\` *required* in the path instead of excluded. `\Backup\` and `\old\` segments still drop the entry.
 
 This tab provides a convenient audit trail of retired parts without removing them from the filesystem.
 

@@ -91,6 +91,17 @@ CATEGORIES = {
 
 PART_RE  = re.compile(r"^(\d{3})-(\d{5})((?:_\d+)*)\.(sldprt|sldasm)$", re.IGNORECASE)
 
+# Permissive variant used by the Orphans / Archive scanner to gate which
+# Everything hits count as real FoxFab part files. Strict PART_RE rejects
+# rev-suffix files (e.g. `200-90123-rA.sldprt`) and numbered-copy files
+# (`200-90123 (1).sldprt`) which are still real parts in the wild. This
+# regex accepts ANY filename starting with `<CAT>-<NNNNN>` followed by
+# anything, ending in .sldprt/.sldasm. Filters out:
+#   ~$200-90123.sldprt           (SolidWorks lock / ~$ temp files)
+#   SS Cam Adaptor_200-9598.sldprt  (vendor parts where the FoxFab-shaped
+#                                    string is just an embedded substring)
+ORPHAN_PART_RE = re.compile(r"^\d{3}-\d{5}.*\.(sldprt|sldasm)$", re.IGNORECASE)
+
 
 def decode_part_filename(name: str) -> Optional["tuple[str, List[str], str]"]:
     """Decode a SolidWorks part filename into category, all covered part numbers,
@@ -2437,27 +2448,48 @@ class OrphanScanWorker(QThread):
                     hits += _eq(session, f'"{cat_code}-{pfx}" ext:{ext} path:"{JOBS_ROOT}"')
 
                 for hit in hits:
-                    full = os.path.join(hit["path"], hit["name"])
+                    name = hit["name"]
+                    # Filter A: filename must start with <CAT>-<NNNNN>... so we
+                    # reject ~$ lock files and vendor parts (e.g.
+                    # `SS Cam Adaptor_200-9598...sldprt`) where the FoxFab-shaped
+                    # number is just an embedded substring.
+                    if not ORPHAN_PART_RE.match(name):
+                        continue
+
+                    path_parts_lc = [p.lower() for p in Path(hit["path"]).parts]
+
+                    # Filter B: scope limited to '201 CAD' folders so vendor
+                    # subfolders (Dirak, Hoffman, OEM library, etc.) inside a
+                    # job tree don't pollute results.
+                    if "201 cad" not in path_parts_lc:
+                        continue
+
+                    # Filter C: skip Backup / old segments (Archive is mode-aware
+                    # below — kept for the Archive tab).
+                    if any(seg in path_parts_lc for seg in ("backup", "old")):
+                        continue
+
+                    full = os.path.join(hit["path"], name)
                     exists_in_db = con.execute(
                         "SELECT 1 FROM parts WHERE full_path=?", (full,)
                     ).fetchone()
                     if not exists_in_db:
-                        is_in_archive = any(
-                            p.lower() == "archive"
-                            for p in Path(full).parts
-                        )
+                        is_in_archive = "archive" in path_parts_lc
                         if self.mode == "archive" and not is_in_archive:
                             continue
                         if self.mode == "orphans" and is_in_archive:
                             continue
-                        m = PART_RE.match(hit["name"])
+                        # Display the filename without extension so rev-suffixed
+                        # (`200-90123-rA`) and combined-part (`200-90123_124`)
+                        # files keep their distinguishing suffix on screen.
+                        display = name.rsplit(".", 1)[0]
                         orphans.append({
-                            "name":       hit["name"],
+                            "name":       name,
                             "full_path":  full,
                             "folder":     hit["path"],
                             "cat_code":   cat_code,
                             "cat_name":   CATEGORIES.get(cat_code, cat_code),
-                            "part_number": f"{cat_code}-{m.group(2)}" if m else hit["name"],
+                            "part_number": display,
                         })
 
             con.close()
@@ -2512,9 +2544,10 @@ class OrphansTab(QWidget):
         il = QHBoxLayout(info)
         il.setContentsMargins(12, 6, 12, 6)
         self.status_lbl = QLabel(
-            "Part files on disk that match your prefix but are not tracked in any scanned job folder, "
-            "excluding files inside 'archive' folders.  "
-            "These may be misplaced, in an un-scanned location, or left over from a deleted job."
+            "FoxFab-pattern part files in '201 CAD' folders under 2 JOBS\\ that exist on disk "
+            "but aren't in the local DB — typically a part created or renamed since the last scan. "
+            "Filters: filename must start with <CAT>-<NNNNN>; path must contain '201 CAD'; "
+            "Archive / Backup / old folders excluded."
         )
         self.status_lbl.setObjectName("lbl_sub")
         self.status_lbl.setWordWrap(True)
@@ -2663,8 +2696,10 @@ class ArchiveTab(QWidget):
         il = QHBoxLayout(info)
         il.setContentsMargins(12, 6, 12, 6)
         self.status_lbl = QLabel(
-            "Part files on disk that match your prefix and live inside an 'archive' folder.  "
-            "These files are not tracked in any active scanned job folder."
+            "FoxFab-pattern part files in '201 CAD\\Archive' folders under 2 JOBS\\ that aren't "
+            "tracked in any active scanned job folder. Filters: filename must start with "
+            "<CAT>-<NNNNN>; path must contain '201 CAD' AND an 'archive' segment; "
+            "Backup / old folders excluded."
         )
         self.status_lbl.setObjectName("lbl_sub")
         self.status_lbl.setWordWrap(True)
