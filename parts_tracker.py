@@ -1786,7 +1786,10 @@ class NextNumbersTab(QWidget):
         try:
             self.refresh()
         except Exception:
-            pass  # skip this tick on transient DB errors (e.g. lock during scan)
+            # Skip this tick on transient DB errors (e.g. lock during scan).
+            # Log to crash.log so we at least know what's failing on the
+            # 5-second poller — silent `pass` here previously hid real bugs.
+            crashlog_exc("NextNumbers._safe_refresh")
 
     def _build(self):
         outer = QVBoxLayout(self)
@@ -1917,6 +1920,7 @@ class NextNumbersTab(QWidget):
             return
         if not self.user_prefix:
             return
+        crashlog(f"NextNumbers._start_gap_scan (prefix={self.user_prefix!r})")
         self._gap_status_lbl.setText("Scanning Everything…")
         self._gap_status_lbl.setStyleSheet("font-size:11px; color:#89b4fa;")
         self._gap_scan_btn.setEnabled(False)
@@ -1929,6 +1933,9 @@ class NextNumbersTab(QWidget):
     def _on_gap_scan_done(self, result: dict):
         # `result` is {"gaps": {...}, "latests": {...}} — see find_gaps_via_everything()
         try:
+            crashlog(f"NextNumbers._on_gap_scan_done "
+                     f"(gaps={sum(len(v) for v in result.get('gaps', {}).values())}, "
+                     f"latests={len(result.get('latests', {}))})")
             self._cached_gaps    = result.get("gaps", {})
             self._cached_latests = result.get("latests", {})
             self._last_gap_scan_at = time.monotonic()
@@ -1938,7 +1945,7 @@ class NextNumbersTab(QWidget):
             self.refresh()
         except Exception:
             # Don't let a slot exception crash Qt — log + drop the result.
-            traceback.print_exc()
+            crashlog_exc("NextNumbers._on_gap_scan_done")
             try:
                 self._gap_status_lbl.setText("Refresh error — see crash.log")
                 self._gap_status_lbl.setStyleSheet("font-size:11px; color:#f38ba8;")
@@ -2183,7 +2190,7 @@ class NextNumbersTab(QWidget):
                     del self._cached_gaps[code]
             self.refresh()
         except Exception:
-            traceback.print_exc()
+            crashlog_exc("NextNumbers._copy_next")
 
     def refresh(self, user_prefix: str = None, cat_prefixes: Dict[str, str] = None):
         if user_prefix:
@@ -3207,13 +3214,15 @@ class MainWindow(QMainWindow):
 
     def _tab_changed(self, index: int):
         try:
+            tab_name = self.tabs.tabText(index).strip()
+            crashlog(f"MainWindow._tab_changed -> {tab_name!r} (index={index})")
             if self.tabs.widget(index) is self.tab_next:
                 self.tab_next.refresh(self.user_prefix, self.cat_prefixes)
                 self.tab_next._start_gap_scan()
             elif self.tabs.widget(index) is self.tab_history:
                 self.tab_history.refresh()
         except Exception:
-            traceback.print_exc()
+            crashlog_exc("MainWindow._tab_changed")
 
     def _reload_tabs(self):
         self.tab_my.refresh(self.user_prefix)
@@ -3253,17 +3262,46 @@ class MainWindow(QMainWindow):
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────
-def _install_excepthook():
-    """Log unhandled exceptions to %APPDATA%\\PartsTracker\\crash.log instead of
-    letting PyQt6 abort the app. PyQt 6.1+ aborts on uncaught slot exceptions
-    by default — this keeps the window alive long enough to keep working."""
-    log_path = DB_PATH.parent / "crash.log"
+CRASH_LOG = DB_PATH.parent / "crash.log"
 
+
+def crashlog(msg: str):
+    """Append a timestamped line to %APPDATA%\\PartsTracker\\crash.log.
+    Used by every diagnostic path so we have ONE file to grep when something
+    goes wrong: startup banners, wrapped Python exceptions, Qt message handler
+    output, and uncaught excepthook output all land here."""
+    try:
+        CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def crashlog_exc(prefix: str = ""):
+    """Append the current exception's traceback to crash.log (for use inside
+    `except:` blocks where `traceback.print_exc()` would only hit stderr)."""
+    try:
+        CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n--- [{datetime.now().isoformat(timespec='seconds')}] "
+                    f"{prefix} ---\n")
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
+    traceback.print_exc(file=sys.stderr)
+
+
+def _install_excepthook():
+    """Log unhandled exceptions to crash.log instead of letting PyQt6 abort the
+    app. PyQt 6.1+ aborts on uncaught slot exceptions by default — this keeps
+    the window alive long enough to keep working."""
     def _hook(typ, value, tb):
         try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n--- {datetime.now().isoformat()} ---\n")
+            CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(CRASH_LOG, "a", encoding="utf-8") as f:
+                f.write(f"\n--- [{datetime.now().isoformat(timespec='seconds')}] "
+                        f"UNHANDLED EXCEPTION ---\n")
                 traceback.print_exception(typ, value, tb, file=f)
         except Exception:
             pass
@@ -3272,8 +3310,37 @@ def _install_excepthook():
     sys.excepthook = _hook
 
 
+def _install_qt_message_handler():
+    """Hook Qt's own logging (qWarning/qCritical/qFatal). Qt-level aborts —
+    e.g. invalid QObject access, layout asserts — go through this channel
+    rather than Python's. Without a custom handler, qFatal calls abort()
+    and we lose all context."""
+    from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def _handler(mode, ctx, message):
+        try:
+            label = {
+                QtMsgType.QtDebugMsg:    "QT-DEBUG",
+                QtMsgType.QtInfoMsg:     "QT-INFO",
+                QtMsgType.QtWarningMsg:  "QT-WARN",
+                QtMsgType.QtCriticalMsg: "QT-CRIT",
+                QtMsgType.QtFatalMsg:    "QT-FATAL",
+            }.get(mode, "QT-?")
+            file = ctx.file or "?"
+            line = ctx.line or 0
+            func = ctx.function or "?"
+            crashlog(f"{label} {message}  ({func} at {file}:{line})")
+        except Exception:
+            pass
+
+    qInstallMessageHandler(_handler)
+
+
 def main():
     _install_excepthook()
+    _install_qt_message_handler()
+    crashlog(f"=== launched (python {sys.version.split()[0]}, "
+             f"argv={sys.argv}) ===")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
