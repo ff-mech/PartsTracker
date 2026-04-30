@@ -42,12 +42,16 @@ Parts Tracker is a PyQt6 desktop application that brings order to SolidWorks par
 - Parses PRF Excel files for catalog number, enclosure size, and other job metadata
 - Per-user prefix filtering so engineers only see their own parts by default
 - Gap-aware next-number suggestions — reuses the lowest available number before issuing a new one
+- **ENGINEERING-wide gap verification** — gap candidates are checked against every `.sldprt` / `.sldasm` under `Z:\FOXFAB_DATA\ENGINEERING`, not just `2 JOBS`. Numbers assigned in `DESIGNERS\...`, `MODEL LIBRARY\`, `0 PRODUCTS\`, or another engineer's scratch area (e.g. `For Vikram\Demo Unit\CAD\`) correctly count as taken
+- **Click-time collision check** before a Copy — looks up the suggested number across the same broad scope; if it's already on disk, the conflict path is shown and the suggestion auto-advances
+- **Duplicate Parts detection** — flags part numbers that appear at more than one path under your prefix (archive folders excluded). Surfaced in the Next Numbers tab; double-click a path to open it in Explorer
 - Background gap scanning on startup with no UI freeze
 - Live filesystem watcher that refreshes part numbers automatically when files change on disk
 - Orphan detection: identifies part files that exist on disk but are not tracked in any job folder
 - Archive classification: parts inside any `archive` folder are separated from active parts
 - Full job history with scanned date and part count
 - Searchable history log of all part additions over time
+- **Crash log** at `%APPDATA%\PartsTracker\crash.log` — captures uncaught Python exceptions, Qt-level fatal/critical messages, and wrapped slot errors so intermittent UI crashes leave a usable trace instead of silently aborting the app
 - Catppuccin Mocha dark theme throughout
 
 ---
@@ -162,10 +166,21 @@ A dashboard of cards — one per category — showing the next available part nu
 
 - If one or more numbers have been deleted or skipped, the lowest missing number is shown first with a `GAP` badge.
 - Clicking the copy button copies that number to the clipboard and removes it from the gap list, automatically advancing to the next gap or to `latest + 1` when no gaps remain.
+- **Click-time collision check** — before a Copy succeeds, the application asks Everything whether the suggested number is on disk *anywhere* under `Z:\FOXFAB_DATA\ENGINEERING`. If a conflicting file is found (e.g. another engineer reserved it in a scratch folder since the last gap scan), the path is shown and the suggestion auto-advances.
 
-Below the cards, the **Gap Analysis** panel lists every missing number per category so engineers can review and reclaim them.
+Below the cards, two stacked panels:
 
-Gap scanning runs in a background thread at startup so the UI remains responsive. A live filesystem watcher monitors the job root and refreshes all cards automatically when files are added or removed on disk.
+#### Gap Analysis
+
+Lists every missing number per category. Each candidate gap is **verified against the broader ENGINEERING scope** — a number that exists in `DESIGNERS\...`, `MODEL LIBRARY\`, `0 PRODUCTS\`, `For Vikram\Demo Unit\CAD\`, or any other location Everything indexes under `Z:\FOXFAB_DATA\ENGINEERING\` is *not* reported as a gap. Latest stays anchored to `Z:\...\2 JOBS\` so a stray number elsewhere doesn't yank it. Gap scanning runs in a background thread at startup so the UI remains responsive.
+
+#### Duplicate Parts
+
+Flags part numbers that appear at more than one distinct path on disk under your prefix range, archive folders excluded. The list is grouped by part number; expanding a row shows each duplicate file's full path and job association. Double-click a path to open it in Explorer.
+
+The duplicate scan filters at read time against `Path.exists()`, so resolved duplicates (one of the two copies deleted or moved) drop out of the report without needing a full DB rescan.
+
+A live filesystem watcher monitors the job root and refreshes the cards automatically when files are added or removed on disk.
 
 ---
 
@@ -259,8 +274,11 @@ Key rules:
 |---|---|
 | SQLite database | `%APPDATA%\PartsTracker\parts.db` |
 | Application settings | Stored within the database |
+| Crash log | `%APPDATA%\PartsTracker\crash.log` |
 
 The database is created automatically on first launch. No manual setup is required. The `%APPDATA%` path resolves to `C:\Users\<username>\AppData\Roaming\PartsTracker\` on a standard Windows installation.
+
+The crash log is created on first error and appended to thereafter. It captures uncaught Python exceptions, Qt-level fatal / critical / warning messages (which previously caused silent `abort()` on certain Qt asserts), wrapped slot exceptions in the Next Numbers tab, and trace breadcrumbs (startup banner, tab change events, gap scan markers). Useful when reporting an intermittent crash — paste the most recent traceback from the file rather than trying to reproduce on the spot.
 
 ---
 
